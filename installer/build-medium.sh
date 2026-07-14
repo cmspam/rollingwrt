@@ -110,7 +110,7 @@ mkdir -p "$TR/etc/apk/keys"   # --initdb makes the db, not the /etc/apk config d
 # fetch the feed indexes; retry, since an unauthenticated GitHub-releases fetch from a CI
 # runner can be rate-limited where a workstation is not.
 for t in 1 2 3; do
-  "$APK" --root "$TR" --allow-untrusted update 2>&1 | tail -8
+  "$APK" --root "$TR" --allow-untrusted update 2>&1 | tail -8 || true   # apk update exits nonzero on a benign repo warning
   [ -n "$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null)" ] && break
   echo "feed not yet visible (attempt $t); retrying"; sleep 15
 done
@@ -125,7 +125,7 @@ OURVER="$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/nu
 OURKM="$("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | grep -F -- "-$OURVER " | grep -oE '^kmod-[a-z0-9._-]+-[0-9][0-9.]*-r[0-9]+' | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u || true)"
 KMODS=""
 for k in $BASEKM $REQKM; do printf '%s\n' "$OURKM" | grep -qxF "$k" && KMODS="$KMODS $k"; done
-KMODS="$(printf '%s' "$KMODS" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')"
+KMODS="$(printf '%s' "$KMODS" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ' || true)"
 echo "installing our kernel + $(printf '%s' "$KMODS" | wc -w) kmods"
 
 mkdir -p "$TR/var/lock" "$TR/var/run" "$TR/tmp" "$TR/etc/rc.d"
