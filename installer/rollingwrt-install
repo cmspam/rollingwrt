@@ -161,6 +161,15 @@ wizard(){
 review_cmdline(){
 	say "Kernel command line"
 	info "base (filled in after partitioning): rollingwrt.root=UUID=<root> rollingwrt.crypt=$([ "$CFG_encrypt" = yes ] && echo 1 || echo 0) rollingwrt.name=$RWRT_MAPPER"
+	# Serial console is opt-in: forcing console=ttyS0 on hardware with no serial port can
+	# stop it booting, so it is off by default and added only for headless serial machines.
+	prompt "Enable serial console (console=ttyS0,115200)? only for headless/serial hardware" "no"
+	if [ "$REPLY" = yes ]; then
+		case " $CFG_cmdline_extra " in
+			*" console=ttyS0"*) : ;;
+			*) CFG_cmdline_extra="${CFG_cmdline_extra:+$CFG_cmdline_extra }console=ttyS0,115200 console=tty0" ;;
+		esac
+	fi
 	prompt "extra kernel args to append (blank for none)" "$CFG_cmdline_extra"; CFG_cmdline_extra="$REPLY"
 }
 
