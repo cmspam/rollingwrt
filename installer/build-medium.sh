@@ -14,6 +14,7 @@
 #
 # Usage: build-medium.sh [out-dir]      (env: PUBKEY_URL or PUBKEY_FILE = our feed key)
 set -euo pipefail
+trap 'rc=$?; echo "build-medium: aborted (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-$HERE/out}"; mkdir -p "$OUT"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
@@ -92,7 +93,8 @@ sudo mount "${LOOP}p2" "$ROOTM"
 # cannot kill the script (it runs under set -e/pipefail); strip the version off each name.
 pkgtmp="$(mktemp)"
 sudo "$APK" --root "$ROOTM" list --installed > "$pkgtmp" 2>&1 || echo "apk list --installed exit $?"
-BASEKM="$(grep -oE '^kmod-[a-z0-9._-]+' "$pkgtmp" | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u)"
+BASEKM="$(grep -oE '^kmod-[a-z0-9._-]+' "$pkgtmp" | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u || true)"
+echo "base image carries $(printf '%s' "$BASEKM" | grep -c . || true) kmods"
 REQKM="kmod-tpm kmod-tpm-crb kmod-tpm-tis kmod-crypto-xts kmod-crypto-ecb kmod-crypto-user kmod-crypto-sha256 kmod-crypto-hmac kmod-crypto-aead kmod-crypto-cbc kmod-dm kmod-fs-vfat kmod-nvme kmod-usb-storage kmod-nft-core"
 
 # our kernel + those kmods, from our feed, into a temp root (offline-install idiom:
@@ -113,7 +115,7 @@ mkdir -p "$TR/etc/apk/keys"   # --initdb makes the db, not the /etc/apk config d
 # stock kmod (a different kernel dep), which would fail the whole apk transaction.
 OURVER="$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null | grep -oE 'rollingwrt-kernel-[0-9][0-9.]*-r[0-9]+' | sed 's/^rollingwrt-kernel-//' | sort -V | tail -1)"
 [ -n "$OURVER" ] || { echo "could not resolve our kernel version from the feed" >&2; exit 1; }
-OURKM="$("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | grep -F -- "-$OURVER " | grep -oE '^kmod-[a-z0-9._-]+-[0-9][0-9.]*-r[0-9]+' | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u)"
+OURKM="$("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | grep -F -- "-$OURVER " | grep -oE '^kmod-[a-z0-9._-]+-[0-9][0-9.]*-r[0-9]+' | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u || true)"
 KMODS=""
 for k in $BASEKM $REQKM; do printf '%s\n' "$OURKM" | grep -qxF "$k" && KMODS="$KMODS $k"; done
 KMODS="$(printf '%s' "$KMODS" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')"
