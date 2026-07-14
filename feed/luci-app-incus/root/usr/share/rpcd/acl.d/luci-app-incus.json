@@ -1,0 +1,11 @@
+{
+	"luci-app-incus": {
+		"description": "Reach the Incus web UI through incus-ui-proxy",
+		"read": {
+			"uci": [ "incus-ui-proxy" ]
+		},
+		"write": {
+			"uci": [ "incus-ui-proxy" ]
+		}
+	}
+}

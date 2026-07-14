@@ -1,0 +1,33 @@
+#!/bin/sh
+# rollingWRT: make OpenWrt's dnsmasq and firewall coexist with incus-managed
+# bridges. incus runs its own dnsmasq (DHCP/DNS) and nftables rules on incusbr0;
+# OpenWrt's system dnsmasq uses bind-dynamic and would otherwise grab port 53 on
+# incusbr0 the moment incus creates it, so incus's own dnsmasq fails to bind.
+# We exclude incus bridges from the system dnsmasq, and add incusbr0 to the lan
+# firewall zone as a device (it is not an OpenWrt-configured "network").
+#
+# This covers the default incusbr0. Additional incus bridges a user creates need
+# the same treatment (uci add_list ...notinterface / ...device).
+
+[ -f /etc/config/dhcp ] && {
+	if uci -q get dhcp.@dnsmasq[0] >/dev/null; then
+		uci -q del_list dhcp.@dnsmasq[0].notinterface='incusbr0'
+		uci add_list dhcp.@dnsmasq[0].notinterface='incusbr0'
+		uci commit dhcp
+	fi
+}
+
+[ -f /etc/config/firewall ] && {
+	# find the zone named "lan" (do not assume index 0)
+	lanzone=""
+	for z in $(uci -q show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='lan'/\1/p"); do
+		lanzone="$z"
+	done
+	if [ -n "$lanzone" ]; then
+		uci -q del_list firewall.$lanzone.device='incusbr0'
+		uci add_list firewall.$lanzone.device='incusbr0'
+		uci commit firewall
+	fi
+}
+
+exit 0

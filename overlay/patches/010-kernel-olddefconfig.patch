@@ -1,0 +1,20 @@
+diff --git a/include/kernel-defaults.mk b/include/kernel-defaults.mk
+index eb852a04..66533861 100644
+--- a/include/kernel-defaults.mk
++++ b/include/kernel-defaults.mk
+@@ -121,10 +121,11 @@ define Kernel/Configure/Default
+ 	$(SCRIPT_DIR)/kconfig.pl 'm+' '+' $(LINUX_DIR)/.config.target /dev/null $(LINUX_DIR)/.config.override > $(LINUX_DIR)/.config.set
+ 	$(call Kernel/SetNoInitramfs)
+ 	rm -rf $(KERNEL_BUILD_DIR)/modules
+-	cmp -s $(LINUX_DIR)/.config.set $(LINUX_DIR)/.config.prev || { \
+-		cp $(LINUX_DIR)/.config.set $(LINUX_DIR)/.config; \
+-		cp $(LINUX_DIR)/.config.set $(LINUX_DIR)/.config.prev; \
+-	}
++	cp $(LINUX_DIR)/.config.set $(LINUX_DIR)/.config
++	printf 'CONFIG_CRYPTO_DRBG=y\nCONFIG_CRYPTO_DRBG_HMAC=y\nCONFIG_CRYPTO_JITTERENTROPY=y\nCONFIG_RD_ZSTD=y\n' >> $(LINUX_DIR)/.config
++	+$(KERNEL_MAKE) olddefconfig
++	cp $(LINUX_DIR)/.config $(LINUX_DIR)/.config.set
++	cp $(LINUX_DIR)/.config $(LINUX_DIR)/.config.prev
+ 	$(_SINGLE) [ -d $(LINUX_DIR)/user_headers ] || $(KERNEL_MAKE) $(if $(findstring uml,$(BOARD)),ARCH=$(ARCH)) INSTALL_HDR_PATH=$(LINUX_DIR)/user_headers headers_install
+ 	grep '=[ym]' $(LINUX_DIR)/.config.set | LC_ALL=C sort | $(MKHASH) md5 > $(LINUX_DIR)/.vermagic
+ endef

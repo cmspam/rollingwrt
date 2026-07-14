@@ -1,0 +1,32 @@
+#!/bin/sh
+# Boot-time TPM unseal of the LUKS key (runs in the initramfs gate). Emits the
+# key on stdout, or fails (the gate then falls back to the passphrase).
+#
+# Verifies the machine-signed PCR-11 policy against the CURRENT PCR 11, so an
+# unexpected/tampered image (different PCR 11) has no valid signature and unseal
+# fails - the security win over plain PCR sealing.
+set -eu
+ESP="${ESP:-/esp}"; R="$ESP/rollingwrt"; SEAL=0x81010001
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+[ -f "$R/pcr11.sig" ] || exit 1
+
+# load the machine public key into the TPM, get its name. The pubkey lives on the
+# ESP (enroll copies it there), NOT in /etc: the initramfs is built before the enroll
+# generates it, and the initramfs does not carry /etc/rollingwrt/keys, so at gate time
+# the only place it exists is the ESP. It is public, and the seal's authorized policy
+# is anchored in the object itself, so serving it from the unencrypted ESP is safe.
+tpm2_loadexternal -C o -G rsa -u "$R/tpm-policy.pub" -c "$TMP/pauth.ctx" >/dev/null
+# -f rsassa: pcr11.sig is a raw PKCS#1 v1.5 signature from `openssl dgst -sign`
+# (rollingwrt-tpm-sign-policy), NOT a marshaled TSS TPMT_SIGNATURE. Without this,
+# tpm2_verifysignature tries to parse it as TPMT_SIGNATURE and fails ("wrong
+# selector"), so the ticket is never made and unlock silently falls to passphrase.
+tpm2_verifysignature -c "$TMP/pauth.ctx" -g sha256 -m "$R/pcr11.policy" \
+	-f rsassa -s "$R/pcr11.sig" -t "$TMP/verif.tkt" >/dev/null
+
+# real policy session: current PCR 11, then authorize with the verified ticket
+tpm2_startauthsession --policy-session -S "$TMP/s.dat" >/dev/null
+tpm2_policypcr -S "$TMP/s.dat" -l "sha256:11" >/dev/null
+tpm2_policyauthorize -S "$TMP/s.dat" -i "$R/pcr11.policy" \
+	-n "$R/policy.name" -t "$TMP/verif.tkt" >/dev/null
+tpm2_unseal -p "session:$TMP/s.dat" -c "$SEAL"
+tpm2_flushcontext "$TMP/s.dat" >/dev/null 2>&1 || true

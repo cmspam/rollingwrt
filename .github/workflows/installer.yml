@@ -1,0 +1,74 @@
+name: installer
+
+# Build the rollingWRT installer medium and publish it to a rolling release tag.
+# Independent of the package build (build.yml): this only needs OpenWrt's official
+# x86-64 ImageBuilder plus our feed's public key, so it is cheap and reruns on its
+# own when the installer sources change. The medium carries rollingwrt-install and
+# the disk tools; the actual rollingWRT packages are pulled from our feed onto the
+# target at install time, so a medium built today still installs the latest feed.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # weekly: the medium rarely needs to change (it pulls the live feed at install
+    # time), but a weekly rebuild keeps its OpenWrt base and disk tools current.
+    - cron: '0 3 * * 0'
+  push:
+    paths:
+      - 'installer/**'
+      - '.github/workflows/installer.yml'
+
+permissions:
+  contents: write        # upload the medium to a release
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  medium:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host deps for the ImageBuilder
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends zstd build-essential libncurses-dev python3 unzip file
+      - name: Build the installer medium
+        run: |
+          chmod +x installer/build-medium.sh
+          # our feed's public key comes from the published snapshot release
+          PUBKEY_URL="https://github.com/${{ github.repository }}/releases/download/snapshot/public-key.pem" \
+            installer/build-medium.sh "$PWD/out"
+      - name: Info
+        id: info
+        run: |
+          IMG=$(ls out/rollingwrt-installer-*-efi.img.gz | head -1)
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$IMG")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(sha256sum "$IMG" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$IMG" | cut -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rollingwrt-installer
+          path: out/rollingwrt-installer-*-efi.img.gz
+          retention-days: 14
+      - name: Publish to the installer release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=installer
+          NOTES="rollingWRT installer medium
+
+          - File: ${{ steps.info.outputs.name }}
+          - Size: ${{ steps.info.outputs.size }}
+          - SHA-256: \`${{ steps.info.outputs.sha }}\`
+
+          Hybrid BIOS+UEFI OpenWrt image carrying \`rollingwrt-install\`. Write it to
+          USB, boot it, and run \`rollingwrt-install\`. It pulls the current rollingWRT
+          feed onto the target at install time, so this medium stays current."
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "${{ github.repository }}" --title "rollingWRT installer" --notes "$NOTES"
+          else
+            gh release edit "$TAG" --repo "${{ github.repository }}" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" "${{ steps.info.outputs.img }}" --repo "${{ github.repository }}" --clobber

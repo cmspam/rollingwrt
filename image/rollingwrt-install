@@ -1,0 +1,234 @@
+#!/bin/sh
+# rollingWRT installer. Offline, minimal (busybox-friendly). Partitions a disk (or
+# uses existing free space / existing partitions), lays down the base rootfs,
+# builds+signs the boot artifact per-machine, and enrolls TPM when encrypting.
+#
+# Layout: ESP (FAT32, holds systemd-boot + the UKI) + root (ext4, or LUKS+ext4).
+# We deliberately do NOT claim the whole disk; the remainder is left free for the
+# user's Incus/ZFS pool. See planning/INSTALLER.md.
+#
+# Modes (--mode):
+#   whole-disk   wipe the disk; make ESP + root; leave the rest free   [default]
+#   free-space   make ESP + root in existing unallocated space; touch nothing else
+#   custom       use pre-made partitions (--esp DEV --root DEV); format only those
+#
+# Interactive by default; --no-prompt requires every value on the command line.
+set -eu
+
+# ---- defaults -------------------------------------------------------------
+MODE=""; DISK=""; ESP_DEV=""; ROOT_DEV=""
+ESP_SIZE="512MiB"; ROOT_SIZE="2GiB"
+ENCRYPT=""; PASSPHRASE=""; ROOTFS=""; NOPROMPT=0
+[ -d /sys/firmware/efi ] && FIRMWARE=efi || FIRMWARE=bios
+
+say(){ printf '%s\n' "$*"; }
+die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage(){ cat <<EOF
+rollingwrt-install --rootfs FILE [options]
+  --disk DEV          target disk (e.g. /dev/sda, /dev/nvme0n1)
+  --mode MODE         whole-disk | free-space | custom   (default whole-disk)
+  --esp DEV           ESP partition   (custom mode)
+  --root DEV          root partition  (custom mode)
+  --esp-size SIZE     ESP size for whole-disk/free-space   (default $ESP_SIZE)
+  --root-size SIZE    root size for whole-disk/free-space  (default $ROOT_SIZE)
+  --encrypt yes|no    LUKS2 on root + TPM auto-unlock (UEFI)
+  --passphrase PASS   LUKS passphrase (else prompted; recovery slot)
+  --rootfs FILE       base rootfs tarball to extract (required)
+  --firmware efi|bios override firmware autodetect (e.g. installing from a
+                      BIOS live env onto a disk that will boot on EFI hardware)
+  --no-prompt         fail rather than prompt for any missing value
+Firmware detected: $FIRMWARE
+EOF
+}
+
+# ---- args -----------------------------------------------------------------
+while [ $# -gt 0 ]; do case "$1" in
+  --disk) DISK="$2"; shift 2;;
+  --mode) MODE="$2"; shift 2;;
+  --esp) ESP_DEV="$2"; shift 2;;
+  --root) ROOT_DEV="$2"; shift 2;;
+  --esp-size) ESP_SIZE="$2"; shift 2;;
+  --root-size) ROOT_SIZE="$2"; shift 2;;
+  --encrypt) ENCRYPT="$2"; shift 2;;
+  --passphrase) PASSPHRASE="$2"; shift 2;;
+  --rootfs) ROOTFS="$2"; shift 2;;
+  --firmware) FIRMWARE="$2"; shift 2;;
+  --no-prompt) NOPROMPT=1; shift;;
+  -h|--help) usage; exit 0;;
+  *) die "unknown option: $1";;
+esac; done
+case "$FIRMWARE" in efi|bios) ;; *) die "invalid --firmware: $FIRMWARE (efi|bios)";; esac
+
+ask(){ # ask VAR "prompt" "default"
+  eval "cur=\${$1:-}"; [ -n "$cur" ] && return 0
+  [ "$NOPROMPT" = 1 ] && die "missing value for $1 (in --no-prompt mode)"
+  printf '%s%s > ' "$2" "${3:+ [$3]}"; read -r ans; [ -z "$ans" ] && ans="$3"
+  eval "$1=\$ans"
+}
+ask_secret(){ # ask_secret VAR "prompt"
+  eval "cur=\${$1:-}"; [ -n "$cur" ] && return 0
+  [ "$NOPROMPT" = 1 ] && die "missing passphrase (in --no-prompt mode)"
+  printf '%s > ' "$2"; stty -echo 2>/dev/null; read -r ans; stty echo 2>/dev/null; printf '\n'
+  eval "$1=\$ans"
+}
+
+# ---- collect config -------------------------------------------------------
+[ -n "$ROOTFS" ] || ask ROOTFS "Path to base rootfs tarball"
+[ -f "$ROOTFS" ] || die "rootfs not found: $ROOTFS"
+[ -n "$MODE" ] || MODE=whole-disk
+
+case "$MODE" in
+  whole-disk|free-space)
+    ask DISK "Target disk (e.g. /dev/sda)"
+    [ -b "$DISK" ] || die "not a block device: $DISK"
+    ask ESP_SIZE "ESP size" "$ESP_SIZE"
+    ask ROOT_SIZE "root size" "$ROOT_SIZE";;
+  custom)
+    ask ESP_DEV "ESP partition (e.g. /dev/sda1)"
+    ask ROOT_DEV "root partition (e.g. /dev/sda2)"
+    [ -b "$ESP_DEV" ] || die "not a block device: $ESP_DEV"
+    [ -b "$ROOT_DEV" ] || die "not a block device: $ROOT_DEV";;
+  *) die "invalid --mode: $MODE (whole-disk|free-space|custom)";;
+esac
+
+# BIOS install uses a prebuilt grub core image whose embedded config reads the ESP
+# as (hd0,gpt1), so the ESP must be GPT partition 1. Only whole-disk mode guarantees
+# that. (UEFI installs find the ESP by content and work in every mode.)
+[ "$FIRMWARE" = bios ] && [ "$MODE" != whole-disk ] && \
+  die "BIOS install requires --mode whole-disk (the ESP must be GPT partition 1); use UEFI for free-space/custom layouts"
+
+[ -n "$ENCRYPT" ] || ask ENCRYPT "Encrypt root with LUKS2? (yes/no)" "yes"
+case "$ENCRYPT" in yes|y|1) ENCRYPT=1;; *) ENCRYPT=0;; esac
+if [ "$ENCRYPT" = 1 ]; then
+  [ "$FIRMWARE" = bios ] && say "NOTE: BIOS install - LUKS uses a passphrase at boot (no TPM auto-unlock on BIOS)."
+  ask_secret PASSPHRASE "LUKS passphrase (recovery slot)"
+  [ -n "$PASSPHRASE" ] || die "empty passphrase"
+fi
+
+# ---- confirm --------------------------------------------------------------
+say ""
+say "About to install rollingWRT:"
+say "  firmware : $FIRMWARE"
+say "  mode     : $MODE"
+case "$MODE" in
+  whole-disk) say "  disk     : $DISK  (ENTIRE DISK WILL BE ERASED)";;
+  free-space) say "  disk     : $DISK  (new ESP+root in FREE SPACE; other partitions kept)";;
+  custom)     say "  ESP      : $ESP_DEV   (reformatted)"
+              say "  root     : $ROOT_DEV  (reformatted); other partitions kept";;
+esac
+say "  encrypt  : $([ "$ENCRYPT" = 1 ] && echo "yes (LUKS2)" || echo no)"
+if [ "$NOPROMPT" != 1 ]; then
+  printf 'Type YES (uppercase) to proceed: '; read -r c; [ "$c" = YES ] || die "aborted"
+fi
+
+partdev(){ # partdev DISK N  -> /dev/sda1 or /dev/nvme0n1p1
+  case "$1" in *[0-9]) echo "${1}p${2}";; *) echo "${1}${2}";; esac
+}
+fs_uuid(){ # print a block device's fs UUID; works with BOTH util-linux and busybox
+  # blkid (busybox has no -s/-o, so parse the `DEV: ... UUID="x" ...` line).
+  blkid "$1" 2>/dev/null | sed -n 's/.*[ :]UUID="\([^"]*\)".*/\1/p' | head -1
+}
+rescan(){ # re-read a disk's partition table and make sure the /dev nodes appear.
+  # Env-agnostic: partprobe (parted) may be absent in the minimal installer image,
+  # partx (util-linux) is; then udev OR busybox mdev create the nodes.
+  partprobe "$1" 2>/dev/null || partx -u "$1" 2>/dev/null || \
+    blockdev --rereadpt "$1" 2>/dev/null || true
+  command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+  busybox mdev -s 2>/dev/null || mdev -s 2>/dev/null || true
+  # wait briefly for the nodes to show up
+  for _ in 1 2 3 4 5; do [ -b "$(partdev "$1" 1)" ] 2>/dev/null && break; sleep 1; done
+}
+
+# ---- partition ------------------------------------------------------------
+case "$MODE" in
+  whole-disk)
+    sgdisk -Z "$DISK"
+    sgdisk -n1:0:+"$ESP_SIZE" -t1:ef00 -c1:ESP "$DISK"
+    sgdisk -n2:0:+"$ROOT_SIZE" -t2:8300 -c2:rollingwrt "$DISK"
+    # BIOS boot from a GPT disk: grub embeds core.img in a BIOS boot partition
+    # (type ef02); grub-bios-setup finds it by type, so its number is irrelevant
+    # and the ESP stays gpt1 (which the grub core image is built to read).
+    [ "$FIRMWARE" = bios ] && sgdisk -n3:0:+1MiB -t3:ef02 -c3:BIOSboot "$DISK"
+    rescan "$DISK"
+    ESP_DEV="$(partdev "$DISK" 1)"; ROOT_DEV="$(partdev "$DISK" 2)";;
+  free-space)
+    # -n0 = next free partition slot, placed in existing free space
+    sgdisk -n0:0:+"$ESP_SIZE" -t0:ef00 -c0:ESP "$DISK"
+    sgdisk -n0:0:+"$ROOT_SIZE" -t0:8300 -c0:rollingwrt "$DISK"
+    rescan "$DISK"
+    ESP_DEV="$(blkid -L ESP 2>/dev/null || true)"; ROOT_DEV="$(blkid -L rollingwrt 2>/dev/null || true)"
+    [ -b "$ESP_DEV" ] && [ -b "$ROOT_DEV" ] || die "could not resolve new partitions in free space";;
+  custom) : ;; # ESP_DEV/ROOT_DEV given
+esac
+[ -b "$ESP_DEV" ] || die "ESP partition missing: $ESP_DEV"
+[ -b "$ROOT_DEV" ] || die "root partition missing: $ROOT_DEV"
+
+# ---- filesystems ----------------------------------------------------------
+mkfs.fat -F32 -n ESP "$ESP_DEV" >/dev/null   # OpenWrt dosfstools ships mkfs.fat (no mkfs.vfat alias)
+if [ "$ENCRYPT" = 1 ]; then
+  printf '%s' "$PASSPHRASE" | cryptsetup luksFormat --type luks2 --batch-mode "$ROOT_DEV" -
+  printf '%s' "$PASSPHRASE" | cryptsetup open "$ROOT_DEV" croot -
+  ROOTFSDEV=/dev/mapper/croot
+else
+  ROOTFSDEV="$ROOT_DEV"
+fi
+mkfs.ext4 -q -L rollingwrt "$ROOTFSDEV"
+ROOTSPEC="UUID=$(fs_uuid "$ROOT_DEV")"
+[ "$ROOTSPEC" != "UUID=" ] || die "could not read root UUID from $ROOT_DEV"
+
+# ---- unpack rootfs --------------------------------------------------------
+ROOT=/mnt/rwrt; mkdir -p "$ROOT"; mount "$ROOTFSDEV" "$ROOT"
+# busybox tar does not auto-detect compression, so pick the flag by extension
+case "$ROOTFS" in
+  *.gz|*.tgz) tar -C "$ROOT" -xzf "$ROOTFS";;
+  *.xz)       tar -C "$ROOT" -xJf "$ROOTFS";;
+  *.zst)      zstdcat "$ROOTFS" | tar -C "$ROOT" -xf -;;
+  *)          tar -C "$ROOT" -xf "$ROOTFS";;
+esac
+mkdir -p "$ROOT/boot" "$ROOT/esp"; mount "$ESP_DEV" "$ROOT/esp"
+mount -t proc proc "$ROOT/proc" 2>/dev/null || true
+mount --rbind /sys "$ROOT/sys" 2>/dev/null || true
+mount --rbind /dev "$ROOT/dev" 2>/dev/null || true
+
+# ---- per-machine keys -----------------------------------------------------
+# Secure Boot keys (PK/KEK/db) are generated + managed by sbctl, invoked via
+# rollingwrt-secureboot below. Here we only make the TPM PCR-11 policy-signing
+# key, which is separate from Secure Boot.
+KEYS="$ROOT/etc/rollingwrt/keys"; mkdir -p "$KEYS"
+[ "$ENCRYPT" = 1 ] && openssl genpkey -algorithm RSA -out "$KEYS/tpm-policy.key" \
+  -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+
+# ---- boot config the on-device UKI builder reads --------------------------
+mkdir -p "$ROOT/etc/rollingwrt"
+ESP_PARENT="${DISK:-$(lsblk -no pkname "$ESP_DEV" 2>/dev/null | sed 's,^,/dev/,')}"
+cat > "$ROOT/etc/rollingwrt/uki.conf" <<EOF
+FIRMWARE=$FIRMWARE
+ESP=/esp
+ESP_DISK=$ESP_PARENT
+CMDLINE="console=tty0 console=ttyS0 rollingwrt.root=$ROOTSPEC rollingwrt.crypt=$ENCRYPT"
+CRYPT=$ENCRYPT
+TPM_SIGN_KEY=/etc/rollingwrt/keys/tpm-policy.key
+EOF
+
+# ---- build boot artifact + enroll -----------------------------------------
+if [ "$FIRMWARE" = efi ]; then
+  chroot "$ROOT" rollingwrt-uki
+  # feed the recovery passphrase to the enroll (its luksAddKey needs it); without
+  # this it would block on a prompt in --no-prompt / scripted installs.
+  [ "$ENCRYPT" = 1 ] && printf '%s' "$PASSPHRASE" | chroot "$ROOT" rollingwrt-tpm-enroll "$ROOT_DEV"
+  chroot "$ROOT" rollingwrt-secureboot enable 2>/dev/null || \
+    say "note: Secure Boot staging skipped (run 'rollingwrt-secureboot enable' after boot)"
+else
+  chroot "$ROOT" rollingwrt-grub-install "$DISK"
+fi
+
+# ---- done -----------------------------------------------------------------
+sync
+umount -R "$ROOT/esp" "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" 2>/dev/null || true
+umount -R "$ROOT" 2>/dev/null || true
+[ "$ENCRYPT" = 1 ] && { cryptsetup close croot 2>/dev/null || true; }
+say ""
+say "rollingWRT installed."
+[ "$FIRMWARE" = efi ] && say "Secure Boot: put firmware in Setup Mode and reboot to auto-enroll your keys."
+say "Reboot when ready."

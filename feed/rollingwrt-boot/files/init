@@ -1,0 +1,134 @@
+#!/bin/sh
+# rollingWRT unlock stub (initramfs /init).
+#
+# This is the "A" gate: it can unlock the encrypted root ("B") unattended, and it
+# carries NO authority of its own. So it exposes NO management interface. Its only
+# outcomes are: (1) unlock B and immediately pivot; (2) prompt for the LUKS
+# passphrase; (3) HALT. It never drops to a shell and a failure never
+# out-privileges success. Cmdline is inside the signed, measured UKI.
+#
+# cmdline (rollingwrt.*):
+#   rollingwrt.root=UUID=...    LUKS (or plain, if crypt=0) root
+#   rollingwrt.crypt=0          root is not encrypted (VM / no-TPM path)
+#   rollingwrt.name=croot       dm-crypt mapper name
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/lib:/lib64:/usr/lib:/usr/lib64
+msg(){ echo "[rollingwrt] $*" > /dev/console 2>&1; }
+halt_gate(){ msg "UNLOCK FAILED: $*"; msg "halting (no recovery shell by design)"; sleep 5; poweroff -f; }
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
+[ -c /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
+
+name=croot; root=; crypt=1; debug=
+for x in $(cat /proc/cmdline); do case "$x" in
+  rollingwrt.root=*)  root="${x#rollingwrt.root=}";;
+  rollingwrt.name=*)  name="${x#rollingwrt.name=}";;
+  rollingwrt.crypt=*) crypt="${x#rollingwrt.crypt=}";;
+  rollingwrt.debug=*) debug="${x#rollingwrt.debug=}";;
+esac; done
+
+KV="$(uname -r)"
+for m in dax tpm tpm_tis_core tpm_tis tpm_crb sha256 hmac cbc aes_generic xts gf128mul \
+         trusted encrypted-keys dm-mod dm-crypt \
+         crypto_user af_alg algif_hash algif_skcipher fat vfat nls_cp437 nls_iso8859-1; do
+  modprobe "$m" 2>/dev/null || { [ -f "/lib/modules/$KV/${m}.ko" ] && insmod "/lib/modules/$KV/${m}.ko" 2>/dev/null; } || true
+done
+busybox mdev -s 2>/dev/null
+
+if [ -n "$debug" ]; then
+  msg "DEBUG /proc/partitions:"; cat /proc/partitions > /dev/console 2>&1
+  msg "DEBUG blkid per block device:"
+  while read -r _ _ _ d; do
+    [ -n "$d" ] && [ -b "/dev/$d" ] && blkid "/dev/$d" > /dev/console 2>&1
+  done < /proc/partitions
+  msg "DEBUG loaded crypto/alg modules:"; grep -E "alg|crypto|dm_|tpm" /proc/modules > /dev/console 2>&1
+  msg "DEBUG /dev tpm nodes:"; ls -l /dev/tpm* > /dev/console 2>&1
+fi
+
+# resolve root device (UUID= or path). busybox blkid with NO args prints nothing;
+# it must be given a device. So probe each block device from /proc/partitions.
+# (init has no set -e, so the "&& break" pattern here is safe.)
+rdev=""
+case "$root" in
+  UUID=*) uuid="${root#UUID=}"
+          rdev="/dev/disk/by-uuid/$uuid"          # present only if mdev made it
+          if [ ! -b "$rdev" ]; then
+            rdev=""
+            while read -r _ _ _ d; do
+              [ -n "$d" ] && [ -b "/dev/$d" ] || continue
+              if blkid "/dev/$d" 2>/dev/null | grep -qF "UUID=\"$uuid\""; then
+                rdev="/dev/$d"; break
+              fi
+            done < /proc/partitions
+          fi
+          ;;
+  /dev/*) rdev="$root";;
+esac
+[ -b "$rdev" ] || halt_gate "root device $root not found"
+
+if [ -n "$debug" ] && [ "$crypt" != "0" ]; then
+  msg "DEBUG cryptsetup isLuks $rdev:"; cryptsetup isLuks "$rdev"; msg "  isLuks rc=$?"
+  insmod "/lib/modules/$KV/dm-crypt.ko" 2>&1 > /dev/console; msg "  explicit dm-crypt insmod rc=$? (0=loaded now, else already/err)"
+  msg "DEBUG dm modules:"; grep -E "dm_|crypt" /proc/modules > /dev/console 2>&1
+fi
+
+if [ "$crypt" = "0" ]; then
+  target="$rdev"
+else
+  opened=0
+  # The signed PCR-11 policy (pcr11.sig/pcr11.policy/policy.name) lives on the ESP.
+  # sd-stub reads the UKI via EFI, but Linux does not auto-mount the ESP, so mount
+  # it read-only here. Find it by content: the vfat partition that has our policy
+  # dir. Without it, TPM unseal is skipped and the gate uses the passphrase.
+  mkdir -p /esp
+  for d in $(while read -r _ _ _ n; do [ -n "$n" ] && echo "$n"; done < /proc/partitions); do
+    [ -b "/dev/$d" ] || continue
+    blkid "/dev/$d" 2>/dev/null | grep -qF 'TYPE="vfat"' || continue
+    if mount -t vfat -o ro "/dev/$d" /esp 2>/dev/null; then
+      [ -f /esp/rollingwrt/pcr11.sig ] && break
+      umount /esp 2>/dev/null || true
+    fi
+  done
+  # 1. TPM unlock via signed PCR-11 policy (PolicyAuthorize). Survives kernel
+  #    updates because the LUKS key is sealed to trust a public key, not a frozen
+  #    PCR; each UKI carries a policy signed for its own PCR 11.
+  # --disable-keyring: keep the volume key OUT of the kernel keyring (put it in the
+  # dm table directly). By design we do not use trusted/encrypted keyring keys; the
+  # key is unsealed in userspace. Without this cryptsetup's default keyring path
+  # makes the dm-crypt reload fail with EINVAL.
+  if [ -x /usr/bin/rollingwrt-tpm-unseal ]; then
+    # keep the unseal's stderr (surfaced below under rollingwrt.debug): a silent
+    # failure here just falls through to the passphrase, which hid several real
+    # initramfs-only bugs (missing dlopen'd TCTI lib, missing mktemp, sig format).
+    if rollingwrt-tpm-unseal > /tmp/key 2>/tmp/tpm-unseal.err && [ -s /tmp/key ]; then
+      cryptsetup open --disable-keyring "$rdev" "$name" --key-file=/tmp/key && opened=1 && msg "TPM unlock OK"
+    fi
+    rm -f /tmp/key
+  fi
+  # 2. Passphrase fallback (tamper / fresh device / TPM change). This is a LUKS
+  #    keyslot secret, not a credential stored in A; it gates recovery only.
+  if [ "$opened" = "0" ]; then
+    tries=0
+    while [ "$tries" -lt 3 ]; do
+      msg "TPM unlock unavailable - enter LUKS passphrase:"
+      if cryptsetup open --disable-keyring "$rdev" "$name" < /dev/console; then opened=1; break; fi
+      tries=$((tries+1))
+    done
+  fi
+  if [ "$opened" != "1" ] && [ -n "$debug" ]; then
+    [ -s /tmp/tpm-unseal.err ] && { msg "DEBUG tpm-unseal stderr:"; cat /tmp/tpm-unseal.err > /dev/console 2>&1; }
+    msg "DEBUG dmesg tail (dm-crypt/crypto errors):"; dmesg 2>/dev/null | grep -iE "crypt|dm-|cipher|alg" | tail -15 > /dev/console 2>&1
+  fi
+  rm -f /tmp/tpm-unseal.err
+  [ "$opened" = "1" ] || halt_gate "could not unlock $rdev"
+  umount /esp 2>/dev/null || true   # release the ESP before switch_root
+  target="/dev/mapper/$name"
+fi
+
+mount -o rw "$target" /newroot || halt_gate "mount $target failed"
+[ -x /newroot/sbin/init ] || halt_gate "no /sbin/init on root"
+for f in proc sys dev; do mount --move "/$f" "/newroot/$f" 2>/dev/null || true; done
+exec switch_root /newroot /sbin/init
+halt_gate "switch_root returned"

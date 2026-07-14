@@ -1,0 +1,82 @@
+#!/bin/sh
+# One-time TPM enroll for signed-PCR-11 auto-unlock (PolicyAuthorize).
+#
+# Seals a fresh LUKS key under a policy that trusts the machine's PUBLIC key
+# (not a frozen PCR value), adds it to a LUKS keyslot, and persists the sealed
+# object. Because the policy trusts a key, each UKI update just re-signs a new
+# PCR-11 policy (rollingwrt-tpm-sign-policy) and unlock keeps working; a tampered
+# image produces a PCR 11 with no valid signature and falls back to passphrase.
+#
+# Approach proven with raw tpm2-tools in the standalone qemu POC (planning notes,
+# owrt-uki-poc): primary is made PERSISTENT to avoid the transient-slot limit;
+# guest uses /dev/tpmrm0. Re-running is idempotent: it drops the keyslot a prior
+# enroll recorded before adding the new one, so it replaces the enrollment rather
+# than stacking orphan keyslots. rollingwrt-tpm-unenroll reverses it. This
+# apk-integrated form still awaits end-to-end validation in a vTPM VM.
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin   # run from installer chroot / first boot
+ROOT_PART="${1:?LUKS partition}"
+K=/etc/rollingwrt/keys; ESP="${ESP:-/esp}"
+PRIM=0x81000000; SEAL=0x81010001
+mkdir -p "$ESP/rollingwrt"
+
+# machine policy-signing key (installer generated the private half)
+openssl rsa -in "$K/tpm-policy.key" -pubout -out "$K/tpm-policy.pub" 2>/dev/null
+# publish the PUBLIC half to the ESP: the boot-time unseal runs in the initramfs,
+# which has no /etc/rollingwrt/keys, so the ESP is the only place it can read it.
+# Public key; the seal's trust is anchored in the object's authorized policy.
+cp "$K/tpm-policy.pub" "$ESP/rollingwrt/tpm-policy.pub"
+tpm2_loadexternal -C o -G rsa -u "$K/tpm-policy.pub" -c /tmp/pauth.ctx >/dev/null
+tpm2_readpublic -c /tmp/pauth.ctx -n "$ESP/rollingwrt/policy.name" >/dev/null
+
+# policy: "any PCR-11 value that is signed by the machine key"
+tpm2_startauthsession -S /tmp/s.dat >/dev/null
+tpm2_policyauthorize -S /tmp/s.dat -L "$ESP/rollingwrt/authorized.policy" \
+	-n "$ESP/rollingwrt/policy.name" >/dev/null
+tpm2_flushcontext /tmp/s.dat >/dev/null
+
+# recovery passphrase: the installer pipes it on stdin. Read it once so we can both
+# drop a slot a previous enroll left behind and authenticate the new luksAddKey.
+IFS= read -r PASS
+SLOTFILE="$ESP/rollingwrt/tpm-keyslot"
+
+# idempotent re-enroll: if a prior run recorded its TPM keyslot, kill that slot
+# first (authenticating with the recovery passphrase) so we replace the sealed key
+# instead of leaving an orphan slot. Best-effort: a missing/already-gone slot is
+# fine.
+if [ -f "$SLOTFILE" ]; then
+	printf '%s' "$PASS" | cryptsetup --disable-locks luksKillSlot "$ROOT_PART" "$(cat "$SLOTFILE")" 2>/dev/null || true
+fi
+
+# fresh LUKS key, added to a keyslot, then sealed under the authorized policy.
+# --disable-locks: a fresh install chroot has no writable cryptsetup lock dir
+# (/run|/var/run/cryptsetup), which would otherwise abort luksAddKey; locking is
+# unneeded here (single-threaded install/enroll). --key-file - authenticates with
+# the recovery passphrase on stdin; the positional file is the NEW key.
+head -c 32 /dev/urandom > /tmp/luks.key
+slot_list() { cryptsetup luksDump "$1" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\):[[:space:]]*luks.*/\1/p'; }
+before="$(slot_list "$ROOT_PART")"
+printf '%s' "$PASS" | cryptsetup --disable-locks luksAddKey "$ROOT_PART" /tmp/luks.key --key-file -
+# record the slot that got the key (LUKS2 luksDump), for idempotent re-enroll and
+# for unenroll's manual-removal hint. ash-safe set difference, no process subst.
+after="$(slot_list "$ROOT_PART")"
+for s in $after; do
+	found=0
+	for b in $before; do [ "$s" = "$b" ] && { found=1; break; }; done
+	[ "$found" = 0 ] && { printf '%s\n' "$s" > "$SLOTFILE"; break; }
+done
+
+tpm2_createprimary -Q -C o -c /tmp/prim.ctx
+tpm2_evictcontrol -Q -C o -c "$PRIM" 2>/dev/null || true
+tpm2_evictcontrol -Q -C o -c /tmp/prim.ctx "$PRIM"
+tpm2_create -Q -C "$PRIM" -u /tmp/seal.pub -r /tmp/seal.priv \
+	-L "$ESP/rollingwrt/authorized.policy" -i /tmp/luks.key
+tpm2_load -Q -C "$PRIM" -u /tmp/seal.pub -r /tmp/seal.priv -c /tmp/seal.ctx
+tpm2_evictcontrol -Q -C o -c "$SEAL" 2>/dev/null || true
+tpm2_evictcontrol -Q -C o -c /tmp/seal.ctx "$SEAL"
+shred -u /tmp/luks.key 2>/dev/null || rm -f /tmp/luks.key
+
+# The PCR-11 policy for the current UKI was already signed by rollingwrt-uki
+# (its step 4, which runs before this during install and on every kernel update).
+# So the sealed key is ready to unlock on next boot; nothing to re-sign here.
+echo "rollingwrt-tpm-enroll: LUKS key sealed at $SEAL under the authorized policy"

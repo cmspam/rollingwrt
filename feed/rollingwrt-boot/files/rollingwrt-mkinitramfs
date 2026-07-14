@@ -1,0 +1,85 @@
+#!/bin/sh
+# Assemble the unlock initramfs: the /init gate, busybox, cryptsetup, tpm2-tools,
+# and the unlock kernel modules for the given kernel version. Output is a
+# zstd-compressed cpio the UKI embeds.
+set -eu
+KVER="${1:?kernel version}"
+OUT="${2:?output cpio path}"
+R="$(mktemp -d)"; trap 'rm -rf "$R"' EXIT
+
+mkdir -p "$R"/bin "$R"/sbin "$R"/lib "$R"/lib64 "$R"/usr/bin "$R"/usr/sbin \
+	"$R"/proc "$R"/sys "$R"/dev "$R"/tmp "$R"/esp "$R"/newroot "$R"/lib/modules/"$KVER" \
+	"$R"/run/cryptsetup "$R"/var/run/cryptsetup   # cryptsetup device-lock dir
+
+# the gate + the TPM unseal helper (both signed inside the UKI via the initrd)
+install -m0755 /usr/lib/rollingwrt/init "$R"/init
+install -m0755 /usr/bin/rollingwrt-tpm-unseal "$R"/usr/bin/rollingwrt-tpm-unseal 2>/dev/null || true
+
+# userland: pull binaries + their shared-lib closure
+bundle() {   # bundle <path-to-binary>: copy it + its .so closure into the initrd
+	install -m0755 "$1" "$R/usr/bin/$(basename "$1")"
+	# musl's ldd is libc.so itself; its output lists resolved libs as "=> PATH"
+	# plus the ld-musl line. Use an if-block (not "[ ] && ..."): under set -e in
+	# busybox ash a false test on the left of && aborts the script. Only absolute
+	# paths are copied, so the stray relative "libc.so" token is skipped safely.
+	for lib in $(ldd "$1" 2>/dev/null | awk '/=>/{print $3} /ld-/{print $1}'); do
+		if [ -f "$lib" ]; then install -D -m0755 "$lib" "$R$lib"; fi
+	done
+}
+for b in busybox cryptsetup blkid; do
+	p="$(command -v "$b" 2>/dev/null)" || continue
+	bundle "$p"
+done
+# tpm2-tools is one `tpm2` dispatcher binary + tpm2_* symlinks; copy the binary
+# ONCE and re-create the symlinks (installing each symlink would copy the whole
+# multi-MB binary per tool and bloat the UKI-embedded initrd).
+if T2="$(command -v tpm2 2>/dev/null)"; then
+	bundle "$T2"
+	for l in /usr/bin/tpm2_*; do
+		if [ -e "$l" ]; then ln -sf tpm2 "$R/usr/bin/$(basename "$l")"; fi
+	done
+	# tpm2 reaches /dev/tpmrm0 via libtss2-tctildr, which dlopen()s the actual TCTI
+	# backend (libtss2-tcti-device) at RUNTIME. ldd cannot see a dlopen, so the .so
+	# closure above misses it; without it every tpm2 command in the initramfs fails
+	# to open the TPM, so TPM unlock silently falls back to the passphrase. Copy the
+	# device backend (its SONAME, plus its own .so closure) explicitly.
+	for t in /usr/lib/libtss2-tcti-device.so.0; do
+		[ -f "$t" ] || continue
+		install -D -m0755 "$t" "$R$t"
+		for lib in $(ldd "$t" 2>/dev/null | awk '/=>/{print $3} /ld-/{print $1}'); do
+			if [ -f "$lib" ]; then install -D -m0755 "$lib" "$R$lib"; fi
+		done
+	done
+fi
+# /bin/sh is /init's shebang interpreter; the target is relative to /bin, so it
+# must be ../usr/bin/busybox (a bare "usr/bin/busybox" resolves to /bin/usr/... ).
+( cd "$R/bin" && ln -sf ../usr/bin/busybox sh )
+# every busybox applet the /init gate invokes (uname is used for KVER; grep/head/
+# cut parse blkid output to resolve root=UUID= when there is no by-uuid symlink;
+# mktemp is used by rollingwrt-tpm-unseal, which runs INSIDE the gate).
+for a in mount switch_root modprobe insmod poweroff mdev sleep cat ls mknod uname rm mkdir \
+         grep head cut sed blkid dmesg mktemp; do
+	( cd "$R/bin" && ln -sf ../usr/bin/busybox "$a" ); done
+
+# the unlock modules for THIS kernel. aes/xts/gf128mul are for LUKS2's default
+# aes-xts cipher; fat/vfat/nls_* let the gate mount the ESP read-only to read the
+# signed PCR-11 policy for TPM unseal (all only used when encrypted, harmless
+# otherwise). Find each .ko under /lib/modules (do NOT depend on modinfo -n).
+# trusted + encrypted-keys MUST precede dm-crypt: this kernel's dm-crypt.ko is
+# link-bound to their symbols (key_type_trusted / key_type_encrypted) and refuses
+# to load without them, even though we open with --disable-keyring.
+for m in dax tpm tpm_tis_core tpm_tis tpm_crb sha256 hmac cbc \
+         aes_generic xts gf128mul trusted encrypted-keys dm-mod dm-crypt \
+         crypto_user af_alg algif_hash algif_skcipher \
+         fat vfat nls_cp437 nls_iso8859-1; do
+	f="$(modinfo -k "$KVER" -n "$m" 2>/dev/null || true)"
+	[ -f "$f" ] || f="$(find "/lib/modules/$KVER" -name "${m}.ko*" 2>/dev/null | head -1)"
+	[ -n "$f" ] && [ -f "$f" ] || continue   # built-in or absent: init falls back
+	install -D -m0644 "$f" "$R/lib/modules/$KVER/$(basename "$f")"
+done
+# module metadata so busybox modprobe can resolve deps; else /init's insmod path
+depmod -b "$R" "$KVER" 2>/dev/null || \
+	cp "/lib/modules/$KVER/modules.builtin" "$R/lib/modules/$KVER/" 2>/dev/null || true
+
+( cd "$R" && find . | cpio -o -H newc 2>/dev/null | zstd -q -19 > "$OUT" )
+echo "rollingwrt-mkinitramfs: $OUT ($(du -h "$OUT" | cut -f1))"

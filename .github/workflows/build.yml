@@ -1,0 +1,351 @@
+name: build
+
+# rollingWRT split build. rollingWRT rides OpenWrt's latest snapshot: the device pulls
+# its whole base userland from OpenWrt's own apk feeds, and we build + host ONLY a custom
+# kernel + every kmod (stock disables KVM_IOAPIC and cannot add the Xe DRM stack) and our
+# add-on packages. The work is split so each job fits GitHub's 6h limit and nothing
+# compiles twice:
+#
+#   resolve ─► kernel-build ─► kernel-publish  (external toolchain: kernel + all kmods +
+#           │                                   kmod-fs-zfs + kernel-as-apk; build, then a
+#           │                                   paced upload of the bucketed kmods feeds)
+#           ├► qemu     (our custom qemu + virglrenderer[Xe native-context]; builds cheap
+#           │            LLVM-free softpipe mesa only for build headers)
+#           ├► incus    (+ cowsql, incus-ui, luci)
+#           ├► zfs      (zfs USERLAND only; its kmod-fs-zfs is built in kernel-build against
+#           │            our kernel, not here against the SDK's stock kernel)
+#           └► boot     (systemd-boot, tpm2, sbctl, the on-device boot tooling)
+#   the pkg jobs' apks + a generated incus-vm metapackage ─► index ─► signed 'snapshot' feed
+#
+# We do NOT build the LLVM mesa variants (libmesa-amd/intel/llvmpipe) - OpenWrt already
+# publishes those for the x86_64 snapshot and we do not patch mesa, so the device pulls
+# them from OpenWrt's video feed at runtime. That removes the old ~4-5h LLVM build pole.
+#
+# The kernel job builds against OpenWrt's own openwrt-toolchain download (EXTERNAL_TOOLCHAIN)
+# so no cross-toolchain is compiled. The package jobs build against OpenWrt's OFFICIAL SDK
+# download. Everything runs in a trixie container so the SDK's prebuilt host tools run in
+# the libc they were built against.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: build every track even if the snapshot did not move
+        type: boolean
+        default: false
+  push:
+    paths:
+      - 'config/**'
+      - 'overlay/**'
+      - 'feed/**'
+      - 'build/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
+
+# One build at a time per ref: a newer push/dispatch/schedule cancels the older run so
+# overlapping triggers (the daily cron racing a push, back-to-back pushes) do not
+# double-build or churn the shared runners.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: rollingwrt-build
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      pin: ${{ steps.r.outputs.pin }}
+      rev: ${{ steps.r.outputs.rev }}
+      tc_url: ${{ steps.r.outputs.tc_url }}
+      sdk_url: ${{ steps.r.outputs.sdk_url }}
+      kernel_version: ${{ steps.r.outputs.kernel_version }}
+      build_kernel: ${{ steps.r.outputs.build_kernel }}
+      build_gpu: ${{ steps.r.outputs.build_gpu }}
+      build_zfs: ${{ steps.r.outputs.build_zfs }}
+      build_main: ${{ steps.r.outputs.build_main }}
+      build_any: ${{ steps.r.outputs.build_any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so the resolver can diff the push to gate per-track builds
+      - id: r
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ github.event.inputs.force }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO_SLUG: ${{ github.repository }}
+        run: bash build/ci-resolve.sh
+
+  # Build the custom kernel + every kmod + the kernel-as-apk + kmod-fs-zfs against OpenWrt's
+  # prebuilt openwrt-toolchain (EXTERNAL_TOOLCHAIN). Host tools are built from source once;
+  # no cross-toolchain and nothing else in the tree is compiled. Uploads the bucketed kmods
+  # (GitHub's 1000-asset-per-release cap) as an artifact; kernel-publish uploads them to the
+  # release feeds, so a publish rate-limit retry re-runs only that job, never this ~1.5h build.
+  kernel-build:
+    needs: resolve
+    if: needs.resolve.outputs.build_kernel == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+      - name: Download external toolchain
+        run: curl -sfL "${{ needs.resolve.outputs.tc_url }}" -o tc.tar.zst
+      - name: Build kernel + all kmods
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/ws" "$PWD/out"
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/ws:/ws" -v "$PWD/out:/out" -w /ws \
+            -e STAGE=kernel -e JOBS="$(nproc)" -e PIN='${{ needs.resolve.outputs.pin }}' \
+            -e OUT=/out -e OWRT=/ws/openwrt -e FEED=/repo/feed -e OVERLAY=/repo/overlay \
+            -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c '
+              set -e
+              mkdir -p /ws/tc
+              tar -C /ws/tc --strip-components=1 -xf /repo/tc.tar.zst
+              export TC_ROOT=/ws/tc/$(ls /ws/tc | grep "^toolchain-" | head -1)
+              HERE=/repo bash /repo/build/build.sh'
+      - name: Upload kmods buckets
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmods-buckets
+          path: out/kmods-*
+          retention-days: 2
+
+  # Upload the ~1000 kmod apks to their release feeds, ONE at a time and paced -
+  # softprops/action-gh-release uploads in parallel and trips GitHub's secondary rate limit
+  # on a feed this large; gh-publish.sh backs off + retries. Separated from the build so a
+  # rate-limit retry re-runs only this job (downloads the artifact), never the kernel build.
+  kernel-publish:
+    needs: [resolve, kernel-build]
+    if: needs.resolve.outputs.build_kernel == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kmods-buckets
+          path: out
+      - name: Publish kmods feeds (paced)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # PRUNE: the kmods feed is fully rebuilt every kernel build and its apks change
+          # filename each time (vermagic decimal), so old apks must be removed or the release
+          # grows past GitHub's 1000-asset cap. The snapshot feed does NOT prune (it carries
+          # unbuilt tracks over).
+          for b in 1 2 3; do
+            PRUNE=1 bash build/gh-publish.sh "snapshot-kmods-$b" "out/kmods-$b" "rollingWRT kernel + kmods $b"
+          done
+
+  # NOTE: we do NOT build the LLVM mesa variants (libmesa-amd/intel/llvmpipe). OpenWrt
+  # already publishes them for the x86_64 snapshot (video feed), built with LLVM, and we
+  # do not patch mesa - so rebuilding them here would burn ~4-5h to reproduce identical
+  # apks. The device pulls them from OpenWrt's video feed at runtime (see the video-feed
+  # line the assembler adds to the device's apk repositories). The qemu job below still
+  # builds the cheap LLVM-free libmesa-softpipe purely for build-time headers/linkage;
+  # it is the same mesa version as OpenWrt's, so the sonames are ABI-compatible.
+
+  # qemu links OpenGL, so it build-depends libmesa-softpipe (LLVM-free) and builds its own
+  # cheap softpipe mesa to link against; at runtime it uses whichever libmesa variant the
+  # device installed from OpenWrt. Also builds our custom virglrenderer (Xe native-context).
+  # (The incus-vm metapackage is NOT built here - it DEPENDS the kvm/vhost/tun kmods, and
+  # OpenWrt would compile those against the SDK's stock kernel; the index job generates its
+  # apk from metadata instead, so no kmod is compiled in a pkg job.)
+  qemu:
+    needs: resolve
+    if: needs.resolve.outputs.build_gpu == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+      - name: Download SDK
+        run: curl -sfL "${{ needs.resolve.outputs.sdk_url }}" -o sdk.tar.zst
+      - name: Build qemu (softpipe OpenGL, no LLVM) against the SDK
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/ws" "$PWD/out"
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/ws:/ws" -v "$PWD/out:/out" -w /ws \
+            -e STAGE=pkg -e JOBS="$(nproc)" -e OWRT=/ws/sdk -e PIN='${{ needs.resolve.outputs.pin }}' \
+            -e SDK_IN='/repo/sdk.tar.zst' \
+            -e EXTRA_FEEDS='video=https://github.com/openwrt/video.git' \
+            -e PKG_DIRS='feeds/video/mesa feeds/rollingwrt/virglrenderer feeds/rollingwrt/qemu feeds/rollingwrt/qemu-firmware-edk2 feeds/rollingwrt/numactl feeds/rollingwrt/usbredir' \
+            -e SELECT='CONFIG_MESA_USE_LLVM=n libmesa-softpipe qemu-x86_64-softmmu qemu-img qemu-firmware-edk2 virglrenderer numactl usbredir' \
+            -e OUT=/out -e FEED=/repo/feed -e OVERLAY=/repo/overlay -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c 'HERE=/repo bash /repo/build/build.sh'
+      - name: Upload qemu apks
+        uses: actions/upload-artifact@v4
+        with: { name: collect-qemu, path: out/collect/*.apk, if-no-files-found: ignore }
+
+  incus:
+    needs: resolve
+    if: needs.resolve.outputs.build_main == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SDK
+        run: curl -sfL "${{ needs.resolve.outputs.sdk_url }}" -o sdk.tar.zst
+      - name: Build incus stack against the SDK
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/ws" "$PWD/out"
+          # SELECT lists xz-utils, lxc and liblxc on top of our own packages. incus's +xz/+tar
+          # and +liblxc runtime deps generate hard `depends on PACKAGE_xz-utils/lxc` guards, and
+          # the SDK silently drops incus (and incus-ui-proxy/luci-app-incus, which need it) unless
+          # those are selected. They build only as prerequisites: collect_apks harvests just the
+          # rollingwrt/luci feeds, so these stock OpenWrt packages are NOT republished - the device
+          # pulls them from OpenWrt's own feed via the runtime deps the incus apk declares.
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/ws:/ws" -v "$PWD/out:/out" -w /ws \
+            -e STAGE=pkg -e JOBS="$(nproc)" -e OWRT=/ws/sdk -e PIN='${{ needs.resolve.outputs.pin }}' \
+            -e SDK_IN='/repo/sdk.tar.zst' \
+            -e PKG_DIRS='feeds/rollingwrt/cowsql-raft feeds/rollingwrt/cowsql feeds/rollingwrt/incus feeds/rollingwrt/incus-ui feeds/rollingwrt/incus-ui-proxy feeds/rollingwrt/luci-app-incus' \
+            -e SELECT='cowsql-raft cowsql incus incus-ui incus-ui-proxy luci-app-incus xz-utils lxc liblxc' \
+            -e OUT=/out -e FEED=/repo/feed -e OVERLAY=/repo/overlay -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c 'HERE=/repo bash /repo/build/build.sh'
+      - name: Upload incus apks
+        uses: actions/upload-artifact@v4
+        with: { name: collect-incus, path: out/collect/*.apk, if-no-files-found: ignore }
+
+  # zfs USERLAND only (zpool/zfs/libs) against the SDK - ZFS_WITH_CONFIG=user builds no
+  # module, and DESELECT drops kmod-fs-zfs so nothing tries to compile a module against the
+  # SDK's stock kernel. The module (kmod-fs-zfs) is built in the kernel job against OUR
+  # kernel and shipped in the kmods feed; the zfs apk declares it as a runtime dep, which
+  # apk resolves there on-device.
+  zfs:
+    needs: resolve
+    if: needs.resolve.outputs.build_zfs == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SDK
+        run: curl -sfL "${{ needs.resolve.outputs.sdk_url }}" -o sdk.tar.zst
+      - name: Build zfs userland against the SDK
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/ws" "$PWD/out"
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/ws:/ws" -v "$PWD/out:/out" -w /ws \
+            -e STAGE=pkg -e JOBS="$(nproc)" -e OWRT=/ws/sdk -e PIN='${{ needs.resolve.outputs.pin }}' \
+            -e SDK_IN='/repo/sdk.tar.zst' -e PKG_DIRS='feeds/rollingwrt/zfs' -e SELECT='zfs' \
+            -e ZFS_WITH_CONFIG=user \
+            -e OUT=/out -e FEED=/repo/feed -e OVERLAY=/repo/overlay -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c 'HERE=/repo bash /repo/build/build.sh'
+      - name: Upload zfs apks
+        uses: actions/upload-artifact@v4
+        with: { name: collect-zfs, path: out/collect/*.apk, if-no-files-found: ignore }
+
+  # The on-device boot stack: systemd-boot + the TPM/Secure-Boot tooling + rollingwrt-boot
+  # (the UKI/LUKS/TPM assembler that runs on-device via apk triggers). rollingwrt-boot's
+  # heavy runtime deps (cryptsetup, efibootmgr, grub2) build for ordering but come from
+  # OpenWrt's own feeds on-device, so collect_apks keeps only our feed's apks.
+  boot:
+    needs: resolve
+    if: needs.resolve.outputs.build_main == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SDK
+        run: curl -sfL "${{ needs.resolve.outputs.sdk_url }}" -o sdk.tar.zst
+      - name: Build the boot stack against the SDK
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/ws" "$PWD/out"
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/ws:/ws" -v "$PWD/out:/out" -w /ws \
+            -e STAGE=pkg -e JOBS="$(nproc)" -e OWRT=/ws/sdk -e PIN='${{ needs.resolve.outputs.pin }}' \
+            -e SDK_IN='/repo/sdk.tar.zst' \
+            -e PKG_DIRS='feeds/rollingwrt/systemd-boot feeds/rollingwrt/tpm2-tss feeds/rollingwrt/tpm2-tools feeds/rollingwrt/sbctl feeds/rollingwrt/rollingwrt-boot' \
+            -e SELECT='systemd-boot tpm2-tss tpm2-tools sbctl rollingwrt-boot' \
+            -e OUT=/out -e FEED=/repo/feed -e OVERLAY=/repo/overlay -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c 'HERE=/repo bash /repo/build/build.sh'
+      - name: Upload boot apks
+        uses: actions/upload-artifact@v4
+        with: { name: collect-boot, path: out/collect/*.apk, if-no-files-found: ignore }
+
+  index:
+    needs: [resolve, kernel-publish, qemu, incus, zfs, boot]
+    # run whenever anything was built, even on a partial (gated) rebuild where some
+    # tracks were skipped - as long as none of the tracks that DID run failed.
+    if: ${{ always() && needs.resolve.outputs.build_any == '1' && !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SDK
+        run: curl -sfL "${{ needs.resolve.outputs.sdk_url }}" -o sdk.tar.zst
+      - name: Gather this run's apks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: collect-*
+          path: collected
+          merge-multiple: true
+      - name: Fetch the previous feed (so skipped tracks stay in the feed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prev
+          # A gated rebuild only produced the changed tracks' apks; carry the rest over
+          # from the last published feed. Newly built apks (same filename) overwrite.
+          gh release download snapshot --dir prev --pattern '*.apk' 2>/dev/null || true
+      - name: Build the single signed feed
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          podman build -t "$IMAGE" -f build/Containerfile build
+          mkdir -p "$PWD/out/collect"
+          cp prev/*.apk "$PWD/out/collect/" 2>/dev/null || true
+          cp collected/*.apk "$PWD/out/collect/" 2>/dev/null || true
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/repo" -v "$PWD/out:/out" -w /repo \
+            -e STAGE=index -e OUT=/out -e OWRT=/out/sdkx \
+            -e SDK_IN='/repo/sdk.tar.zst' \
+            -e FEED=/repo/feed -e APK_SIGNING_KEY \
+            "$IMAGE" bash -c 'HERE=/repo bash /repo/build/build.sh'
+      - name: Record the built manifest (drives next run's gating)
+        run: |
+          v() { sed -n 's/^PKG_VERSION[[:space:]]*[:?]*=[[:space:]]*//p' "feed/$1/Makefile" | head -1; }
+          cat > out/manifest.json <<EOF
+          {
+            "rev": "${{ needs.resolve.outputs.rev }}",
+            "pin": "${{ needs.resolve.outputs.pin }}",
+            "kernel": "${{ needs.resolve.outputs.kernel_version }}",
+            "incus": "$(v incus)",
+            "qemu": "$(v qemu)",
+            "zfs": "$(v zfs)",
+            "cowsql": "$(v cowsql)",
+            "cowsql-raft": "$(v cowsql-raft)",
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+      - name: Publish the snapshot feed (paced)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp -f out/public-key.pem out/manifest.json out/feed/ 2>/dev/null || true
+          bash build/gh-publish.sh snapshot out/feed "rollingWRT add-on feed"

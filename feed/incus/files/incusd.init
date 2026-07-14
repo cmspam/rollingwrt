@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+INCUSD=/usr/sbin/incusd
+SHUTDOWN_TIMEOUT=60
+
+start_service() {
+	procd_open_instance incus
+	procd_set_param command "$INCUSD" --group root
+	# Where incusd finds the bundled web UI. EDK2/OVMF is found on the default
+	# search path (/usr/share/qemu, /usr/share/OVMF), so no env override needed.
+	procd_set_param env INCUS_UI=/usr/share/incus/ui
+	procd_set_param limits nofile="1048576 1048576" nproc="unlimited"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# Graceful appliance shutdown: cleanly stop instances and the daemon rather
+	# than letting procd kill it out from under running guests.
+	[ -x "$INCUSD" ] && "$INCUSD" shutdown --timeout "$SHUTDOWN_TIMEOUT" 2>/dev/null
+}
+
+reload_service() {
+	procd_send_signal incus
+}

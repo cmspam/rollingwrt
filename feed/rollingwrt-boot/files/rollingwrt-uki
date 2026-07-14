@@ -1,0 +1,90 @@
+#!/bin/sh
+# rollingWRT: build + sign the UKI on the machine.
+#
+# The inversion of stock OpenWrt: the kernel is a real file-owning apk whose
+# post-install trigger runs this. So `apk upgrade` moves the kernel + matched
+# kmods AND rewrites the boot UKI in one step. Signing is per-machine (our own db
+# key via sbctl), so no central key opens another machine's disk.
+#
+# Assemble initramfs -> sd-stub UKI (objcopy) -> install under /EFI/Linux with
+# sd-boot as the loader -> re-sign the PCR-11 TPM policy -> sign the UKI + loader
+# with our db key. Config: /etc/rollingwrt/uki.conf (written by the installer).
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin   # runs from an apk trigger; don't assume PATH
+CONF=/etc/rollingwrt/uki.conf
+. "$CONF"                                   # FIRMWARE, KVER, CMDLINE, ESP, TPM_SIGN_KEY, CRYPT, ESP_DISK
+
+# BIOS machines have no EFI/UKI/Secure Boot: take the GRUB path instead.
+if [ "${FIRMWARE:-efi}" = bios ]; then
+	exec rollingwrt-grub-install "${ESP_DISK:?ESP_DISK unset in uki.conf}"
+fi
+
+KVER="${KVER:-$(ls /lib/modules | sort -V | tail -1)}"
+KERNEL="/boot/vmlinuz-$KVER"; [ -f "$KERNEL" ] || KERNEL=/boot/vmlinuz
+STUB=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
+SDBOOT=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+echo "rollingwrt-uki: kernel $KVER"
+
+# 1. initramfs: the unlock gate + its modules/tools
+rollingwrt-mkinitramfs "$KVER" "$WORK/initrd.cpio.zst"
+
+# 2. assemble the sd-stub UKI (objcopy adds the sections sd-stub measures into
+#    PCR 11; rollingwrt-pcr11-predict reproduces that measurement exactly)
+[ -f "$STUB" ] || { echo "rollingwrt-uki: missing sd-stub ($STUB); install systemd-boot" >&2; exit 1; }
+printf '%s' "$CMDLINE" > "$WORK/cmdline"
+# place the added sections ABOVE the stub's own sections (objcopy needs absolute
+# VMAs > the stub's last section + ImageBase; fixed low offsets = "below image
+# base"). Compute the next 64K-aligned VMA and lay sections out sequentially.
+maxend=0
+for L in $(objdump -h "$STUB" | awk '/^ *[0-9]+ +\./{print $3"|"$4}'); do
+	sz=${L%%|*}; vma=${L##*|}; e=$(( 0x$vma + 0x$sz ))
+	if [ "$e" -gt "$maxend" ]; then maxend=$e; fi
+done
+off=$(( (maxend + 0xffff) & ~0xffff ))
+ADD=""
+for pair in ".osrel=/etc/os-release" ".cmdline=$WORK/cmdline" ".linux=$KERNEL" ".initrd=$WORK/initrd.cpio.zst"; do
+	s=${pair%%=*}; f=${pair#*=}
+	ADD="$ADD --add-section $s=$f --change-section-vma $s=$(printf '0x%x' "$off")"
+	fsz=$(wc -c < "$f"); off=$(( (off + fsz + 0xffff) & ~0xffff ))   # wc -c: no busybox stat applet
+done
+objcopy $ADD "$STUB" "$WORK/uki.efi"
+
+# 3. install: sd-boot loader + the UKI under /EFI/Linux (sd-boot auto-discovers it)
+mkdir -p "$ESP/EFI/Linux" "$ESP/EFI/systemd" "$ESP/EFI/BOOT" "$ESP/loader" "$ESP/rollingwrt"
+UKI="$ESP/EFI/Linux/rollingwrt-$KVER.efi"
+cp "$WORK/uki.efi" "$UKI"
+# keep only the current kernel's UKI (no multi-kernel rollback by design)
+for old in "$ESP"/EFI/Linux/rollingwrt-*.efi; do
+	[ "$old" = "$UKI" ] || rm -f "$old" 2>/dev/null || true
+done
+if [ -f "$SDBOOT" ]; then
+	cp "$SDBOOT" "$ESP/EFI/systemd/systemd-bootx64.efi"
+	cp "$SDBOOT" "$ESP/EFI/BOOT/BOOTX64.EFI"
+fi
+[ -f "$ESP/loader/loader.conf" ] || printf 'timeout 1\nsecure-boot-enroll force\n' > "$ESP/loader/loader.conf"
+
+# 4. TPM auto-unlock: re-sign the expected PCR-11 policy for this UKI. PolicyAuth
+#    trusts the key, not a frozen PCR, so unlock survives the update. (sbctl's PE
+#    signature in step 5 is appended to the cert table, not a measured section, so
+#    it does not change PCR 11 - computing here on the unsigned UKI is correct.)
+if [ "${CRYPT:-1}" = "1" ] && [ -f "${TPM_SIGN_KEY:-}" ]; then
+	rollingwrt-tpm-sign-policy "$UKI" "$TPM_SIGN_KEY" "$ESP/rollingwrt/pcr11.sig" || \
+		echo "rollingwrt-uki: WARNING policy re-sign failed; boot falls back to passphrase"
+fi
+
+# 5. Secure Boot: sign the UKI + loader with our db key (sbctl records them so a
+#    later `sbctl sign-all` re-signs after key rotation)
+if command -v sbctl >/dev/null 2>&1; then
+	sbctl sign -s "$UKI" >/dev/null 2>&1 || true
+	[ -f "$ESP/EFI/systemd/systemd-bootx64.efi" ] && sbctl sign -s "$ESP/EFI/systemd/systemd-bootx64.efi" >/dev/null 2>&1 || true
+	[ -f "$ESP/EFI/BOOT/BOOTX64.EFI" ] && sbctl sign -s "$ESP/EFI/BOOT/BOOTX64.EFI" >/dev/null 2>&1 || true
+fi
+
+# 6. firmware boot entry -> sd-boot (BOOTX64.EFI is the removable-media fallback)
+if command -v efibootmgr >/dev/null 2>&1 && [ -n "${ESP_DISK:-}" ]; then
+	efibootmgr -c -d "$ESP_DISK" -p "${ESP_PART:-1}" -L rollingWRT \
+		-l '\EFI\systemd\systemd-bootx64.efi' >/dev/null 2>&1 || true
+fi
+echo "rollingwrt-uki: installed $UKI (+ sd-boot)"

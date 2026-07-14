@@ -1,0 +1,47 @@
+#!/bin/sh
+# Undo rollingwrt-tpm-enroll: turn off TPM auto-unlock so the LUKS root opens only
+# with its recovery passphrase again. Removes the sealed key's LUKS keyslot, evicts
+# the persistent TPM objects, and deletes the ESP policy material. Safe to re-run.
+#
+# Like the rest of the boot stack, this awaits end-to-end validation in a vTPM VM
+# (see the project boot-path roadmap); the TPM steps mirror the proven enroll POC.
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT_PART="${1:?LUKS partition}"
+ESP="${ESP:-/esp}"; R="$ESP/rollingwrt"
+PRIM=0x81000000; SEAL=0x81010001
+
+# 1. Remove the TPM key's LUKS keyslot. Recover the sealed key via the same unseal
+#    path the boot gate uses, then luksRemoveKey it: that deletes exactly the slot
+#    the key opens, needing no slot number and no passphrase. If the unseal fails
+#    (e.g. PCR 11 no longer matches a signed policy) we cannot recover the key here;
+#    the recorded slot, if any, is reported for manual removal. The TPM + ESP side
+#    is still cleaned below either way.
+KEY="$(mktemp)"; trap 'shred -u "$KEY" 2>/dev/null || rm -f "$KEY"' EXIT
+if rollingwrt-tpm-unseal > "$KEY" 2>/dev/null && [ -s "$KEY" ]; then
+	if cryptsetup --disable-locks luksRemoveKey "$ROOT_PART" "$KEY"; then
+		echo "rollingwrt-tpm-unenroll: removed the TPM LUKS keyslot"
+	else
+		echo "rollingwrt-tpm-unenroll: WARNING the TPM keyslot was not removed (already gone?)"
+	fi
+else
+	echo "rollingwrt-tpm-unenroll: WARNING could not unseal the TPM key to remove its slot."
+	if [ -f "$R/tpm-keyslot" ]; then
+		echo "  Remove it manually with your recovery passphrase:"
+		echo "    cryptsetup luksKillSlot $ROOT_PART $(cat "$R/tpm-keyslot")"
+	else
+		echo "  Remove it manually: see 'cryptsetup luksDump $ROOT_PART' then luksKillSlot."
+	fi
+fi
+
+# 2. Evict the persistent TPM objects (sealed key, then primary). Idempotent.
+tpm2_evictcontrol -Q -C o -c "$SEAL" 2>/dev/null || true
+tpm2_evictcontrol -Q -C o -c "$PRIM" 2>/dev/null || true
+echo "rollingwrt-tpm-unenroll: evicted TPM handles $SEAL and $PRIM"
+
+# 3. Remove the ESP policy material so no stale trust anchor or signed policy remains.
+rm -f "$R/tpm-policy.pub" "$R/authorized.policy" "$R/policy.name" \
+	"$R/pcr11.policy" "$R/pcr11.sig" "$R/tpm-keyslot"
+echo "rollingwrt-tpm-unenroll: removed ESP policy files under $R"
+
+echo "rollingwrt-tpm-unenroll: done; the LUKS root now unlocks only with its passphrase"
