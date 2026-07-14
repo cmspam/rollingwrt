@@ -107,14 +107,21 @@ mkdir -p "$TR/etc/apk/keys"   # --initdb makes the db, not the /etc/apk config d
   echo "$RWRT_REL/snapshot/packages.adb"
   for b in 1 2 3; do echo "$RWRT_REL/snapshot-kmods-$b/packages.adb"; done
 } > "$TR/etc/apk/repositories"
-"$APK" --root "$TR" --allow-untrusted update >/dev/null 2>&1 || true
+# fetch the feed indexes; retry, since an unauthenticated GitHub-releases fetch from a CI
+# runner can be rate-limited where a workstation is not.
+for t in 1 2 3; do
+  "$APK" --root "$TR" --allow-untrusted update 2>&1 | tail -8
+  [ -n "$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null)" ] && break
+  echo "feed not yet visible (attempt $t); retrying"; sleep 15
+done
+echo "apk sees $("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | wc -l) packages"
 
 # our kernel's exact version (bump-proof) and the names of every kmod our feed packages
 # at it, so we keep only modules our kernel actually ships: a base-image name we build in,
 # or a target-special like button-hotplug, is dropped rather than pulling an incompatible
 # stock kmod (a different kernel dep), which would fail the whole apk transaction.
-OURVER="$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null | grep -oE 'rollingwrt-kernel-[0-9][0-9.]*-r[0-9]+' | sed 's/^rollingwrt-kernel-//' | sort -V | tail -1)"
-[ -n "$OURVER" ] || { echo "could not resolve our kernel version from the feed" >&2; exit 1; }
+OURVER="$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null | grep -oE 'rollingwrt-kernel-[0-9][0-9.]*-r[0-9]+' | sed 's/^rollingwrt-kernel-//' | sort -V | tail -1 || true)"
+[ -n "$OURVER" ] || { echo "our kernel is not visible in the feed after update; aborting" >&2; exit 1; }
 OURKM="$("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | grep -F -- "-$OURVER " | grep -oE '^kmod-[a-z0-9._-]+-[0-9][0-9.]*-r[0-9]+' | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u || true)"
 KMODS=""
 for k in $BASEKM $REQKM; do printf '%s\n' "$OURKM" | grep -qxF "$k" && KMODS="$KMODS $k"; done
