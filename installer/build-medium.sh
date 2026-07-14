@@ -77,7 +77,6 @@ img="$(find "$IB/bin/targets/x86/64" -name '*rollingwrt-installer*ext4-combined-
 # /lib/modules with ours. We install our kernel plus exactly the kmods the base image already
 # carries, so nothing the medium loads is left at a mismatched vermagic.
 echo "==> swapping in our kernel"
-set -x
 OWRT_SNAP="https://downloads.openwrt.org/snapshots"
 RWRT_REL="${RWRT_REL:-https://github.com/cmspam/rollingwrt/releases/download}"
 APK="$IB/staging_dir/host/bin/apk"
@@ -88,16 +87,13 @@ ESPM="$(mktemp -d)"; ROOTM="$(mktemp -d)"
 sudo mount "${LOOP}p1" "$ESPM"
 sudo mount "${LOOP}p2" "$ROOTM"
 
-# the kmods the base image carries (so we install OUR versions of the same set).
-# apk's exit must not kill the script (it runs under set -e/pipefail), so read to a file.
+# modules for the medium: the set the base image carries (its hardware coverage) plus the
+# TPM + LUKS essentials the stock base lacks. Read the base set to a file so apk's exit
+# cannot kill the script (it runs under set -e/pipefail); strip the version off each name.
 pkgtmp="$(mktemp)"
 sudo "$APK" --root "$ROOTM" list --installed > "$pkgtmp" 2>&1 || echo "apk list --installed exit $?"
-# strip the version suffix (-6.18.38-r1): a bare name resolves to OUR .decimal build,
-# a versioned name would pin the stock version, which is not in our feed.
-KMODS="$(grep -oE '^kmod-[a-z0-9._-]+' "$pkgtmp" | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u | tr '\n' ' ')"
-echo "base image kmods: $(printf '%s' "$KMODS" | wc -w)"
-# fallback (apk list gave nothing): a set covering what an installer medium needs
-[ -n "$KMODS" ] || KMODS="kmod-crypto-xts kmod-crypto-ecb kmod-crypto-user kmod-crypto-sha256 kmod-crypto-hmac kmod-dm kmod-fs-vfat kmod-tpm kmod-tpm-crb kmod-tpm-tis kmod-e1000e kmod-e1000 kmod-igb kmod-igc kmod-ixgbe kmod-r8169 kmod-tg3 kmod-nvme kmod-usb-storage kmod-nft-core kmod-button-hotplug"
+BASEKM="$(grep -oE '^kmod-[a-z0-9._-]+' "$pkgtmp" | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u)"
+REQKM="kmod-tpm kmod-tpm-crb kmod-tpm-tis kmod-crypto-xts kmod-crypto-ecb kmod-crypto-user kmod-crypto-sha256 kmod-crypto-hmac kmod-crypto-aead kmod-crypto-cbc kmod-dm kmod-fs-vfat kmod-nvme kmod-usb-storage kmod-nft-core"
 
 # our kernel + those kmods, from our feed, into a temp root (offline-install idiom:
 # IPKG_INSTROOT + pre-made runtime dirs + --force-no-chroot so post-installs do not hang)
@@ -109,11 +105,24 @@ mkdir -p "$TR/etc/apk/keys"   # --initdb makes the db, not the /etc/apk config d
   echo "$RWRT_REL/snapshot/packages.adb"
   for b in 1 2 3; do echo "$RWRT_REL/snapshot-kmods-$b/packages.adb"; done
 } > "$TR/etc/apk/repositories"
-"$APK" --root "$TR" --allow-untrusted update >/dev/null 2>&1 || true   # nonzero on a benign repo warning; the add below is the real check
+"$APK" --root "$TR" --allow-untrusted update >/dev/null 2>&1 || true
+
+# our kernel's exact version (bump-proof) and the names of every kmod our feed packages
+# at it, so we keep only modules our kernel actually ships: a base-image name we build in,
+# or a target-special like button-hotplug, is dropped rather than pulling an incompatible
+# stock kmod (a different kernel dep), which would fail the whole apk transaction.
+OURVER="$("$APK" --root "$TR" --allow-untrusted list rollingwrt-kernel 2>/dev/null | grep -oE 'rollingwrt-kernel-[0-9][0-9.]*-r[0-9]+' | sed 's/^rollingwrt-kernel-//' | sort -V | tail -1)"
+[ -n "$OURVER" ] || { echo "could not resolve our kernel version from the feed" >&2; exit 1; }
+OURKM="$("$APK" --root "$TR" --allow-untrusted list 2>/dev/null | grep -F -- "-$OURVER " | grep -oE '^kmod-[a-z0-9._-]+-[0-9][0-9.]*-r[0-9]+' | sed -E 's/-[0-9][0-9.]*-r[0-9]+$//' | sort -u)"
+KMODS=""
+for k in $BASEKM $REQKM; do printf '%s\n' "$OURKM" | grep -qxF "$k" && KMODS="$KMODS $k"; done
+KMODS="$(printf '%s' "$KMODS" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')"
+echo "installing our kernel + $(printf '%s' "$KMODS" | wc -w) kmods"
+
 mkdir -p "$TR/var/lock" "$TR/var/run" "$TR/tmp" "$TR/etc/rc.d"
 # shellcheck disable=SC2086
 IPKG_INSTROOT="$TR" "$APK" --root "$TR" --allow-untrusted --force-no-chroot --preserve-env add rollingwrt-kernel $KMODS >/dev/null 2>&1 || true
-KVER="$(ls "$TR/lib/modules" 2>/dev/null | head -1)"
+KVER="$(ls "$TR/lib/modules" 2>/dev/null | head -1 || true)"
 [ -n "$KVER" ] && [ -f "$TR/boot/vmlinuz-$KVER" ] || { echo "our kernel install produced no vmlinuz/modules" >&2; exit 1; }
 
 sudo cp -f "$TR/boot/vmlinuz-$KVER" "$ESPM/boot/vmlinuz"
