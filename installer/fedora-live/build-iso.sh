@@ -32,7 +32,7 @@ ROOTFS="$WORK/rootfs"
 ISOROOT="$WORK/isoroot"
 FEDORA_REL="${FEDORA_REL:-44}"
 ISO_DATE="$(date -u --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y.%m.%d)"
-ISO_LABEL="ROLLINGWRT_INSTALL"
+ISO_LABEL="RWRT_INSTALL"
 ISO_NAME="rollingwrt-installer-${ISO_DATE}"
 
 # feed key sources: OpenWrt's snapshot key is committed (no stable URL upstream);
@@ -204,12 +204,10 @@ echo "==> Building LiveOS/rootfs.img and squashing it"
 SQUASH_WORK=$(mktemp -d)
 mkdir -p "$SQUASH_WORK/LiveOS"
 ROOTFS_MB=$(( ($(du -sk "$ROOTFS" | awk '{print $1}') / 1024) + 256 ))
+# -d populates the ext4 image straight from the directory, so the build needs no
+# loop mount (works in any container, privileged or not).
 truncate -s "${ROOTFS_MB}M" "$SQUASH_WORK/LiveOS/rootfs.img"
-mkfs.ext4 -L rootfs -F "$SQUASH_WORK/LiveOS/rootfs.img" >/dev/null
-ROOTFS_MNT=$(mktemp -d)
-mount -o loop "$SQUASH_WORK/LiveOS/rootfs.img" "$ROOTFS_MNT"
-cp -a "$ROOTFS"/. "$ROOTFS_MNT/"
-umount "$ROOTFS_MNT"; rmdir "$ROOTFS_MNT"
+mkfs.ext4 -q -L rootfs -F -d "$ROOTFS" "$SQUASH_WORK/LiveOS/rootfs.img"
 mkdir -p "$ISOROOT/LiveOS"
 mksquashfs "$SQUASH_WORK" "$ISOROOT/LiveOS/squashfs.img" \
 	-comp zstd -Xcompression-level 19 -b 1M -no-xattrs -noappend
