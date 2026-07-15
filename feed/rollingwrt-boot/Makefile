@@ -25,7 +25,8 @@ define Package/rollingwrt-boot
   CATEGORY:=Base system
   TITLE:=rollingWRT UKI + LUKS/TPM boot tooling
   # runtime deps for on-device UKI build/sign + TPM unlock
-  DEPENDS:=+cryptsetup +tpm2-tools +sbctl +efibootmgr +binutils +zstd \
+  # bsdtar packs the initramfs cpio (OpenWrt's stock busybox has no cpio applet)
+  DEPENDS:=+cryptsetup +tpm2-tools +sbctl +efibootmgr +binutils +zstd +bsdtar \
 	+openssl-util +libopenssl +systemd-boot +grub2 \
 	+kmod-dm +kmod-tpm +kmod-tpm-tis +kmod-tpm-crb +kmod-crypto-sha256
 endef

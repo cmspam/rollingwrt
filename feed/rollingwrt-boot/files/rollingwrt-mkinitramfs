@@ -101,5 +101,7 @@ done
 depmod -b "$R" "$KVER" 2>/dev/null || \
 	cp "/lib/modules/$KVER/modules.builtin" "$R/lib/modules/$KVER/" 2>/dev/null || true
 
-( cd "$R" && find . | cpio -o -H newc 2>/dev/null | zstd -q -19 > "$OUT" )
+# pack the newc cpio the UKI/kernel unpack. OpenWrt's stock busybox is built without
+# the cpio applet, so use bsdtar (libarchive), which writes the same newc format.
+( cd "$R" && find . | bsdtar --format newc -cf - -T - 2>/dev/null | zstd -q -19 > "$OUT" )
 echo "rollingwrt-mkinitramfs: $OUT ($(du -h "$OUT" | cut -f1))"
