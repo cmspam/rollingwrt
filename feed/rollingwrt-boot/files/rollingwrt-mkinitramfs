@@ -7,6 +7,26 @@ KVER="${1:?kernel version}"
 OUT="${2:?output cpio path}"
 R="$(mktemp -d)"; trap 'rm -rf "$R"' EXIT
 
+# OpenWrt's busybox has no coreutils `install` applet, so provide the subset used here
+# (-D make parent dirs, -m MODE) with busybox cp/mkdir/chmod. Runs at every kernel update.
+install() {
+	_mkdir=0; _mode=
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-D) _mkdir=1; shift ;;
+			-m) _mode="$2"; shift 2 ;;
+			-m*) _mode="${1#-m}"; shift ;;
+			--) shift; break ;;
+			-*) shift ;;
+			*) break ;;
+		esac
+	done
+	[ "$_mkdir" = 1 ] && mkdir -p "$(dirname "$2")"
+	cp "$1" "$2" || return 1
+	[ -n "$_mode" ] && chmod "$_mode" "$2"
+	return 0
+}
+
 mkdir -p "$R"/bin "$R"/sbin "$R"/lib "$R"/lib64 "$R"/usr/bin "$R"/usr/sbin \
 	"$R"/proc "$R"/sys "$R"/dev "$R"/tmp "$R"/esp "$R"/newroot "$R"/lib/modules/"$KVER" \
 	"$R"/run/cryptsetup "$R"/var/run/cryptsetup   # cryptsetup device-lock dir

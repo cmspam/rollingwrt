@@ -274,6 +274,12 @@ profile_pkgs(){
 }
 deploy_apk(){
 	say "Installing the base system (apk)"
+	# OpenWrt's /var is a symlink to /tmp; lay it (and /tmp) before apk touches the root, so
+	# apk --initdb's /var/cache/apk and base-files' own /var->/tmp symlink both land cleanly.
+	# If /var were left a real directory, base-files could not commit its symlink and /var
+	# would be broken on the installed system.
+	mkdir -p "$TARGET/tmp/lock" "$TARGET/tmp/run" "$TARGET/etc/rc.d"
+	[ -e "$TARGET/var" ] || ln -s /tmp "$TARGET/var"
 	apk --root "$TARGET" --initdb add >/dev/null 2>&1 || apk --root "$TARGET" --initdb >/dev/null 2>&1 || true
 	mkdir -p "$TARGET/etc/apk/keys"
 	# trusted keys: OpenWrt's (for the base feeds) + ours (for our feed)
@@ -299,8 +305,12 @@ deploy_apk(){
 	# (enable rc.d symlinks under $TARGET, defer service starts to first boot).
 	# The post-installs (procd service enable) need these runtime dirs to exist, exactly
 	# as OpenWrt's rootfs.mk pre-creates them before running the scripts; without them the
-	# procd lock/enable fails on the fresh target and the install stalls.
-	mkdir -p "$TARGET/var/lock" "$TARGET/var/run" "$TARGET/tmp" "$TARGET/etc/rc.d"
+	# procd lock/enable fails on the fresh target and the install stalls. OpenWrt's /var is
+	# a symlink to /tmp, so create the dirs under /tmp and lay /var as that symlink here;
+	# creating /var/* directly would leave /var a real dir and base-files could not commit
+	# its /var->/tmp symlink (breaking /var on the installed system).
+	mkdir -p "$TARGET/tmp/lock" "$TARGET/tmp/run" "$TARGET/etc/rc.d"
+	[ -e "$TARGET/var" ] || ln -s /tmp "$TARGET/var"
 	# shellcheck disable=SC2086
 	IPKG_INSTROOT="$TARGET" apk --root "$TARGET" --force-no-chroot --preserve-env add $pkgs
 }
