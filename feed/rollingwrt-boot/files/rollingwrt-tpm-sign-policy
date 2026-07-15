@@ -11,7 +11,7 @@
 # safely falls back to the passphrase, it does not brick.
 set -eu
 UKI="${1:?uki path}"; SIGNKEY="${2:?policy signing key}"; SIGOUT="${3:?signature out}"
-ESP="${ESP:-/esp}"; TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 # 1. expected PCR 11 for this UKI (predictor emits the 64-char sha256 hex)
 hex="$(rollingwrt-pcr11-predict "$UKI")"
@@ -27,5 +27,6 @@ tpm2_flushcontext "$TMP/s.dat" >/dev/null
 
 # 3. sign the policy digest with the machine key -> the boot-time authorization
 openssl dgst -sha256 -sign "$SIGNKEY" -out "$SIGOUT" "$TMP/policy.digest"
-cp "$TMP/policy.digest" "$ESP/rollingwrt/pcr11.policy"
+# the policy digest lives next to its signature on the ESP (same dir rollingwrt-uki made)
+cp "$TMP/policy.digest" "$(dirname "$SIGOUT")/pcr11.policy"
 echo "rollingwrt-tpm-sign-policy: signed PCR-11 policy -> $SIGOUT"
