@@ -136,6 +136,22 @@ cat > "$ROOTFS/root/.bash_profile" <<'EOF'
 EOF
 chroot "$ROOTFS" systemctl enable NetworkManager.service sshd.service >/dev/null 2>&1 || true
 
+# reach the live env over SSH for a headless install (Fedora defaults to
+# prohibit-password for root, which blocks the documented root:rollingwrt login)
+mkdir -p "$ROOTFS/etc/ssh/sshd_config.d"
+cat > "$ROOTFS/etc/ssh/sshd_config.d/00-rollingwrt-live.conf" <<'EOF'
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+
+# autologin on serial too, so a headless (serial-console) install just works
+mkdir -p "$ROOTFS/etc/systemd/system/serial-getty@ttyS0.service.d"
+cat > "$ROOTFS/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -f -- \\u' --keep-baud 115200,57600,38400,9600 --autologin root --noclear %I $TERM
+EOF
+
 rm -f "$ROOTFS/etc/os-release" "$ROOTFS/usr/lib/os-release"
 cat > "$ROOTFS/usr/lib/os-release" <<EOF
 NAME="rollingWRT Installer"
@@ -229,7 +245,7 @@ set timeout=3
 set default=0
 search --no-floppy --set=root --label ${ISO_LABEL}
 menuentry 'rollingWRT Installer (live)' {
-    linuxefi /images/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image selinux=0 enforcing=0 audit=0 quiet rd.plymouth=0 plymouth.enable=0
+    linuxefi /images/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image selinux=0 enforcing=0 audit=0 console=tty0 console=ttyS0,115200 rd.plymouth=0 plymouth.enable=0
     initrdefi /images/initramfs.img
 }
 menuentry 'rollingWRT Installer (live, troubleshoot - rd.shell)' {
@@ -244,7 +260,7 @@ set timeout=3
 set default=0
 search --no-floppy --set=root --label ${ISO_LABEL}
 menuentry 'rollingWRT Installer (live)' {
-    linux /images/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image selinux=0 enforcing=0 audit=0 quiet rd.plymouth=0 plymouth.enable=0
+    linux /images/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image selinux=0 enforcing=0 audit=0 console=tty0 console=ttyS0,115200 rd.plymouth=0 plymouth.enable=0
     initrd /images/initramfs.img
 }
 menuentry 'rollingWRT Installer (live, troubleshoot - rd.shell)' {
