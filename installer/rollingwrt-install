@@ -1,0 +1,452 @@
+#!/bin/sh
+# rollingWRT installer.
+#
+# Lays rollingWRT onto a machine: partition, encrypt (LUKS2), an ext4 root, an
+# apk bootstrap of the OpenWrt base plus our feed, then the boot ceremony that is
+# just the first run of the on-device assembler (rollingwrt-secureboot,
+# rollingwrt-uki, rollingwrt-tpm-enroll reading /etc/rollingwrt/uki.conf). The
+# same scripts an `apk upgrade` later triggers, so install and update share a path.
+#
+# The root the boot gate expects: a LUKS partition holding a plain ext4 root
+# (the initramfs does `mount /dev/mapper/croot /newroot`; it does not import a
+# pool), plus a vfat ESP that carries the signed PCR-11 policy. ZFS, when asked
+# for, is a SEPARATE data pool for incus/NAS storage, not the root.
+#
+# Runnable two ways:
+#   interactive : `rollingwrt-install`         (asks, confirms, installs)
+#   scripted    : source it, set CFG[*], call the stages (the image builders and
+#                 the test harness do this so they never drift from the real path)
+set -eu
+
+# dir this script (and rollingwrt-common.sh) live in. A scripted caller that sources
+# this file sets RWRT_INSTALLER_DIR first, since POSIX `.` does not change $0.
+HERE="${RWRT_INSTALLER_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# shellcheck source=rollingwrt-common.sh
+. "$HERE/rollingwrt-common.sh"
+
+# ---------------------------------------------------------------- config + output
+# CFG holds every install decision. Defaults here; the wizard or parse_args fill
+# the rest. A scripted caller sets CFG[*] directly and skips the wizard.
+CFG_disk=""; CFG_mode="auto"; CFG_reserve=""
+CFG_esp=""; CFG_root=""                      # resolved partition devices
+CFG_encrypt="yes"; CFG_passphrase=""
+CFG_profile="hypervisor"                    # router | hypervisor | nas | minimal
+CFG_extra_pkgs=""; CFG_extra_kmods=""
+CFG_hostname="rollingwrt"; CFG_password=""; CFG_sshkey=""
+CFG_cmdline_extra=""                        # user additions to the kernel cmdline
+CFG_firmware=""                             # efi | bios (probed)
+ASSUME_YES="${ASSUME_YES:-no}"              # skip the destructive confirm (scripted)
+TARGET="${TARGET:-/mnt/rwrt}"
+
+say(){ printf '%s\n' "${C_B}==>${C_0} $*"; }
+info(){ printf '    %s\n' "$*"; }
+warn(){ printf '%s\n' "${C_Y}!! ${C_0} $*" >&2; }
+die(){ printf '%s\n' "${C_R}xx ${C_0} $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- small helpers
+prompt(){ # question default -> REPLY
+	printf '%s' "$1"; [ -n "${2:-}" ] && printf ' [%s]' "$2"; printf ': '
+	IFS= read -r REPLY || REPLY=""
+	[ -z "$REPLY" ] && REPLY="${2:-}"
+}
+prompt_secret(){ printf '%s: ' "$1"; stty -echo 2>/dev/null; IFS= read -r REPLY || REPLY=""; stty echo 2>/dev/null; printf '\n'; }
+pick(){ # title default opt... -> REPLY  (accepts a number or a typed value)
+	title="$1"; def="$2"; shift 2; i=1
+	printf '%s\n' "$title"
+	for o in "$@"; do printf '  %d) %s\n' "$i" "$o"; i=$((i+1)); done
+	prompt "  choose" "$def"; n="$REPLY"
+	case "$n" in ''|*[!0-9]*) : ;; *) i=1; for o in "$@"; do [ "$i" = "$n" ] && { REPLY="$o"; return; }; i=$((i+1)); done ;; esac
+}
+size_to_bytes(){ # 100G / 512M / 2T -> bytes
+	v="$1"; n="${v%[GgMmTtKk]}"; u="${v#"$n"}"
+	case "$u" in K|k) echo $((n*1024));; M|m) echo $((n*1024*1024));; G|g) echo $((n*1024*1024*1024));;
+		T|t) echo $((n*1024*1024*1024*1024));; *) echo "$n";; esac
+}
+psep(){ case "$1" in *[0-9]) echo p;; *) echo "";; esac; }   # nvme0n1 -> p, sda -> ''
+partdev(){ echo "$1$(psep "$1")$2"; }                        # disk, index -> /dev/nvme0n1p2
+
+# fetch an SSH key spec into REPLY: github:USER / gh:USER / gl:USER / @file / raw key
+resolve_sshkey(){
+	case "$1" in
+		github:*|gh:*) u="${1#github:}"; u="${u#gh:}"; REPLY="$(curl -fsSL "https://github.com/$u.keys" 2>/dev/null || true)";;
+		gitlab:*|gl:*) u="${1#gitlab:}"; u="${u#gl:}"; REPLY="$(curl -fsSL "https://gitlab.com/$u.keys" 2>/dev/null || true)";;
+		@*) REPLY="$(cat "${1#@}" 2>/dev/null || true)";;
+		ssh-*) REPLY="$1";;
+		"") REPLY="";;
+		*) REPLY="$1";;
+	esac
+}
+
+# --------------------------------------------------------------------- preflight
+is_uefi(){ [ -d /sys/firmware/efi ]; }
+has_tpm(){ [ -c /dev/tpmrm0 ] || [ -c /dev/tpm0 ]; }
+setup_mode(){ # 0 if firmware Secure Boot is in Setup Mode
+	f=/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c
+	[ -r "$f" ] && [ "$(tail -c1 "$f" | od -An -tu1 | tr -d ' ')" = 1 ]
+}
+preflight(){
+	CFG_firmware="$(is_uefi && echo efi || echo bios)"
+	for t in sgdisk cryptsetup mkfs.ext4 mkfs.fat apk blkid lsblk wipefs; do
+		command -v "$t" >/dev/null 2>&1 || die "missing required tool: $t"
+	done
+	say "Hardware"
+	info "firmware       : $CFG_firmware$( [ "$CFG_firmware" = bios ] && echo '  (UEFI needed for Secure Boot / signed UKI / TPM unlock)')"
+	if [ "$CFG_firmware" = efi ]; then
+		info "secure boot    : $(setup_mode && echo 'Setup Mode (keys enroll automatically)' || echo 'User Mode (enter firmware once to clear keys, then it self-enrolls)')"
+		info "TPM 2.0        : $(has_tpm && echo present || echo 'absent (encryption falls back to passphrase-only)')"
+	fi
+	if [ "$CFG_firmware" = bios ]; then die "BIOS install is not wired in this installer version yet; UEFI only for now."; fi
+}
+
+list_disks(){ lsblk -dnro NAME,SIZE,MODEL 2>/dev/null | awk '$1 !~ /^(loop|sr|ram)/{print}'; }
+
+# ----------------------------------------------------------------------- wizard
+wizard(){
+	say "Target disk"
+	list_disks | sed 's/^/    /'
+	def="$(list_disks | awk 'NR==1{print $1}')"
+	prompt "  disk to install to" "$def"; CFG_disk="/dev/${REPLY#/dev/}"
+	[ -b "$CFG_disk" ] || die "not a block device: $CFG_disk"
+
+	pick "How should the disk be used?" 1 \
+		"Whole disk (erase $CFG_disk, use all of it)" \
+		"Whole disk, reserve free space at the end" \
+		"Use existing free space (leave current partitions alone)" \
+		"Custom (you picked partitions already)"
+	case "$REPLY" in
+		Whole\ disk,\ reserve*) CFG_mode="auto-reserve"; prompt "  free space to leave" "100G"; CFG_reserve="$REPLY";;
+		Use\ existing*)         CFG_mode="freespace";;
+		Custom*)                CFG_mode="custom";
+			prompt "  ESP partition (existing, will be shared not wiped)" ""; CFG_esp="$REPLY"
+			prompt "  root partition (will be ENCRYPTED and erased)" ""; CFG_root="$REPLY";;
+		*)                      CFG_mode="auto";;
+	esac
+
+	pick "Profile (which package set to install)" 2 \
+		"minimal (router base only)" "hypervisor (incus + qemu + zfs)" \
+		"nas (zfs + shares)" "router (network stack, no virt)"
+	CFG_profile="${REPLY%% *}"
+
+	prompt "Encrypt the root with LUKS + TPM auto-unlock?" "yes"; CFG_encrypt="$REPLY"
+	if [ "$CFG_encrypt" = yes ]; then
+		while :; do
+			prompt_secret "  recovery passphrase (also the fallback if the TPM changes)"; p1="$REPLY"
+			prompt_secret "  repeat passphrase"; [ "$REPLY" = "$p1" ] && { CFG_passphrase="$p1"; break; }
+			warn "passphrases did not match"
+		done
+	fi
+
+	prompt "Hostname" "rollingwrt"; CFG_hostname="$REPLY"
+	prompt "Admin SSH key (github:USER, gitlab:USER, @file, or paste a key; blank to skip)" ""
+	if [ -n "$REPLY" ]; then
+		resolve_sshkey "$REPLY"; CFG_sshkey="$REPLY"
+		if [ -n "$CFG_sshkey" ]; then
+			info "fetched $(printf '%s' "$CFG_sshkey" | grep -c .) key(s):"
+			printf '%s\n' "$CFG_sshkey" | sed 's/^\(.\{0,50\}\).*/      \1.../'
+			prompt "  use these keys?" "yes"; [ "$REPLY" = yes ] || CFG_sshkey=""
+		else warn "could not fetch any key for that spec"; fi
+	fi
+	if [ -z "$CFG_sshkey" ]; then
+		while :; do
+			prompt_secret "  root password (SSH key was skipped)"; p1="$REPLY"
+			prompt_secret "  repeat password"; [ "$REPLY" = "$p1" ] && { CFG_password="$p1"; break; }
+			warn "passwords did not match"
+		done
+	fi
+}
+
+# review + edit the kernel command line before the UKI is built (user asked for
+# this). The base rollingwrt.* args are computed later once the LUKS UUID exists;
+# here we only take extra args to append.
+review_cmdline(){
+	say "Kernel command line"
+	info "base (filled in after partitioning): rollingwrt.root=UUID=<root> rollingwrt.crypt=$([ "$CFG_encrypt" = yes ] && echo 1 || echo 0) rollingwrt.name=$RWRT_MAPPER"
+	# Serial console is opt-in: forcing console=ttyS0 on hardware with no serial port can
+	# stop it booting, so it is off by default and added only for headless serial machines.
+	prompt "Enable serial console (console=ttyS0,115200)? only for headless/serial hardware" "no"
+	if [ "$REPLY" = yes ]; then
+		case " $CFG_cmdline_extra " in
+			*" console=ttyS0"*) : ;;
+			*) CFG_cmdline_extra="${CFG_cmdline_extra:+$CFG_cmdline_extra }console=ttyS0,115200 console=tty0" ;;
+		esac
+	fi
+	prompt "extra kernel args to append (blank for none)" "$CFG_cmdline_extra"; CFG_cmdline_extra="$REPLY"
+}
+
+confirm_destructive(){
+	[ "$ASSUME_YES" = yes ] && return 0
+	say "About to install rollingWRT"
+	case "$CFG_mode" in
+		auto)         info "This ERASES all of $CFG_disk.";;
+		auto-reserve) info "This ERASES $CFG_disk but leaves $CFG_reserve free at the end.";;
+		freespace)    info "This uses free space on $CFG_disk; existing partitions are NOT touched.";;
+		custom)       info "This ENCRYPTS and erases $CFG_root and shares the ESP $CFG_esp; nothing else is touched.";;
+	esac
+	prompt "Type YES to proceed" ""; [ "$REPLY" = YES ] || die "aborted"
+}
+
+# --------------------------------------------------------------- disk teardown
+dismantle_layers(){ # best-effort teardown of any stacking on a disk before we wipe
+	d="$1"
+	# unmount anything already mounted off this disk (a re-run, or a prior OS);
+	# lazy-unmount if a plain unmount says the mount is busy.
+	for mp in $(lsblk -nro MOUNTPOINT "$d" 2>/dev/null | grep -v '^$' | sort -r); do
+		umount -R "$mp" 2>/dev/null || umount -Rl "$mp" 2>/dev/null || true
+	done
+	for m in $(lsblk -nro NAME,TYPE "$d" 2>/dev/null | awk '$2=="crypt"{print $1}'); do
+		cryptsetup close "$m" 2>/dev/null || dmsetup remove -f "$m" 2>/dev/null || true
+	done
+	command -v zpool >/dev/null 2>&1 && zpool labelclear -f "$d" 2>/dev/null || true
+	for p in $(lsblk -nro NAME "$d" 2>/dev/null | tail -n +2); do wipefs -af "/dev/$p" 2>/dev/null || true; done
+	wipefs -af "$d" 2>/dev/null || true
+	dd if=/dev/zero of="$d" bs=1M count=16 conv=fsync 2>/dev/null || true
+}
+
+# -------------------------------------------------------------- partitioning
+# UEFI layout: p1 = ESP (ef00, vfat), p2 = LUKS root (8304). An optional ZFS data
+# partition can take the tail. We never carve a scratch partition (apk needs none).
+partition(){
+	case "$CFG_mode" in
+		auto|auto-reserve) partition_auto;;
+		freespace)         partition_freespace;;
+		custom)            partition_custom;;
+	esac
+	udevadm settle 2>/dev/null || sleep 1
+}
+partition_auto(){
+	say "Partitioning $CFG_disk (mode $CFG_mode)"
+	dismantle_layers "$CFG_disk"
+	sgdisk --zap-all "$CFG_disk" >/dev/null
+	sgdisk --new=1:0:+512M --typecode=1:ef00 --change-name=1:"$RWRT_ESP_LABEL" "$CFG_disk" >/dev/null
+	if [ "$CFG_mode" = auto-reserve ]; then
+		rmib=$(( $(size_to_bytes "$CFG_reserve") / 1024 / 1024 ))
+		sgdisk --new=2:0:-"${rmib}"M --typecode=2:8304 --change-name=2:"$RWRT_ROOT_LABEL" "$CFG_disk" >/dev/null
+	else
+		sgdisk --new=2:0:0 --typecode=2:8304 --change-name=2:"$RWRT_ROOT_LABEL" "$CFG_disk" >/dev/null
+	fi
+	CFG_esp="$(partdev "$CFG_disk" 1)"; CFG_root="$(partdev "$CFG_disk" 2)"
+	MADE_ESP=yes
+}
+partition_freespace(){
+	say "Partitioning free space on $CFG_disk"
+	# sgdisk 0 = next free slot / next free sector; do NOT zap existing partitions.
+	sgdisk --new=0:0:+512M --typecode=0:ef00 --change-name=0:"$RWRT_ESP_LABEL" "$CFG_disk" >/dev/null
+	sgdisk --largest-new=0 --typecode=0:8304 --change-name=0:"$RWRT_ROOT_LABEL" "$CFG_disk" >/dev/null
+	udevadm settle 2>/dev/null || sleep 1
+	CFG_esp="/dev/disk/by-partlabel/$RWRT_ESP_LABEL"; CFG_root="/dev/disk/by-partlabel/$RWRT_ROOT_LABEL"
+	MADE_ESP=yes
+}
+partition_custom(){
+	say "Using existing partitions"
+	[ -b "$CFG_esp" ] || die "ESP $CFG_esp is not a block device"
+	[ -b "$CFG_root" ] || die "root $CFG_root is not a block device"
+	# Share, do not wipe, an existing ESP: only mkfs it if it is not already vfat.
+	if blkid "$CFG_esp" 2>/dev/null | grep -qi 'TYPE="vfat"'; then MADE_ESP=no; info "sharing existing ESP $CFG_esp"
+	else MADE_ESP=yes; fi
+}
+
+# ------------------------------------------------------------- filesystems
+setup_target(){
+	say "Creating filesystems"
+	if [ "${MADE_ESP:-yes}" = yes ]; then mkfs.fat -F32 -n "$RWRT_ESP_LABEL" "$CFG_esp" >/dev/null; fi
+	if [ "$CFG_encrypt" = yes ]; then
+		printf '%s' "$CFG_passphrase" | cryptsetup luksFormat --type luks2 --batch-mode --label "$RWRT_ROOT_LABEL" "$CFG_root" -
+		printf '%s' "$CFG_passphrase" | cryptsetup open "$CFG_root" "$RWRT_MAPPER" -
+		ROOT_DEV="/dev/mapper/$RWRT_MAPPER"
+	else
+		ROOT_DEV="$CFG_root"
+	fi
+	mkfs.ext4 -F -q -L "$RWRT_ROOT_LABEL" "$ROOT_DEV"
+	mkdir -p "$TARGET"; mount "$ROOT_DEV" "$TARGET"
+	mkdir -p "$TARGET/boot/efi"; mount "$CFG_esp" "$TARGET/boot/efi"
+	# the UUID the boot gate matches on is the LUKS partition (or the plain root)
+	ROOT_UUID="$(blkid -s UUID -o value "$CFG_root")"
+}
+
+# --------------------------------------------------------------- apk deploy
+profile_pkgs(){
+	case "$CFG_profile" in
+		hypervisor) echo "zfs kmod-fs-zfs incus incus-vm qemu-x86_64-softmmu";;
+		nas)        echo "zfs kmod-fs-zfs samba4-server";;
+		router)     echo "";;
+		*)          echo "";;
+	esac
+}
+deploy_apk(){
+	say "Installing the base system (apk)"
+	# OpenWrt's /var is a symlink to /tmp; lay it (and /tmp) before apk touches the root, so
+	# apk --initdb's /var/cache/apk and base-files' own /var->/tmp symlink both land cleanly.
+	# If /var were left a real directory, base-files could not commit its symlink and /var
+	# would be broken on the installed system.
+	mkdir -p "$TARGET/tmp/lock" "$TARGET/tmp/run" "$TARGET/etc/rc.d"
+	[ -e "$TARGET/var" ] || ln -s /tmp "$TARGET/var"
+	apk --root "$TARGET" --initdb add >/dev/null 2>&1 || apk --root "$TARGET" --initdb >/dev/null 2>&1 || true
+	mkdir -p "$TARGET/etc/apk/keys"
+	# trusted keys: OpenWrt's (for the base feeds) + ours (for our feed)
+	for k in /etc/apk/keys/* "$HERE"/keys/*; do [ -f "$k" ] && cp -f "$k" "$TARGET/etc/apk/keys/"; done 2>/dev/null || true
+	# OpenWrt's feeds give the whole userland including the target feed (libc, dropbear,
+	# grub2, ... that we do not rebuild). That target feed also carries OpenWrt's own kernel
+	# and kmods, but ours are versioned <ver>.<vermagic-decimal> which apk sorts ABOVE
+	# OpenWrt's <ver>, so the device installs our kernel and our kmods, never OpenWrt's.
+	{
+		echo "$OWRT_SNAP/targets/x86/64/packages/packages.adb"
+		echo "$OWRT_SNAP/packages/x86_64/base/packages.adb"
+		echo "$OWRT_SNAP/packages/x86_64/packages/packages.adb"
+		echo "$RWRT_REL/snapshot/packages.adb"
+		for b in 1 2 3; do echo "$RWRT_REL/snapshot-kmods-$b/packages.adb"; done
+	} > "$TARGET/etc/apk/repositories"
+	pkgs="$RWRT_BASE_PKGS $(profile_pkgs) $CFG_extra_pkgs $CFG_extra_kmods"
+	# Offline install: apk runs each package's post-install CHROOTED by default, where
+	# IPKG_INSTROOT is empty, so OpenWrt's post-install scripts take the RUNNING-system
+	# path and try to start services (procd) - which hangs, since procd/uci/var-lock do
+	# not exist in a fresh target. Mirror OpenWrt's own rootfs.mk offline idiom instead:
+	# --force-no-chroot runs the scripts in this environment (not the target) and
+	# --preserve-env passes IPKG_INSTROOT down, so the scripts take the install path
+	# (enable rc.d symlinks under $TARGET, defer service starts to first boot).
+	# The post-installs (procd service enable) need these runtime dirs to exist, exactly
+	# as OpenWrt's rootfs.mk pre-creates them before running the scripts; without them the
+	# procd lock/enable fails on the fresh target and the install stalls. OpenWrt's /var is
+	# a symlink to /tmp, so create the dirs under /tmp and lay /var as that symlink here;
+	# creating /var/* directly would leave /var a real dir and base-files could not commit
+	# its /var->/tmp symlink (breaking /var on the installed system).
+	mkdir -p "$TARGET/tmp/lock" "$TARGET/tmp/run" "$TARGET/etc/rc.d"
+	[ -e "$TARGET/var" ] || ln -s /tmp "$TARGET/var"
+	# shellcheck disable=SC2086
+	IPKG_INSTROOT="$TARGET" apk --root "$TARGET" --force-no-chroot --preserve-env add $pkgs
+
+	# apk's offline install materialises a package "alternative" (a priority-ranked symlink
+	# in /lib/apk/packages/*.alternatives) only when that package's post-install calls
+	# update_alternatives. Packages that instead rely on apk's trigger are missed - notably
+	# uclient-fetch, which ships the /usr/bin/wget that apk ITSELF execs to fetch feeds
+	# (apk-mbedtls depends on wget-any). Without it a fresh install cannot apk update/upgrade
+	# at all, the whole point of a rolling distro. Create every alternative ourselves the same
+	# way the post-installs do: OpenWrt's update_alternatives from the target's
+	# /lib/functions.sh, with IPKG_INSTROOT pointing at the target (its `root`). No chroot -
+	# /dev and /proc are not bound under $TARGET yet, and this is pure symlink work.
+	if [ -f "$TARGET/lib/functions.sh" ]; then
+		for a in "$TARGET"/lib/apk/packages/*.alternatives; do
+			[ -e "$a" ] || continue
+			p=${a##*/}
+			IPKG_INSTROOT="$TARGET" sh -c '. "$IPKG_INSTROOT/lib/functions.sh"; update_alternatives install "$1"' _ "${p%.alternatives}" >/dev/null 2>&1 || true
+		done
+	fi
+
+	# Persistent /var. rollingWRT is a disk hypervisor/NAS, not a flash router: incus
+	# (/var/lib/incus), zfs and sbctl keep state under /var. base-files (pulled from OpenWrt's
+	# feed, built WITHOUT CONFIG_TARGET_ROOTFS_PERSIST_VAR) ships /var as a symlink into tmpfs
+	# (/tmp), so all that state is wiped every reboot. Replicate OpenWrt's PERSIST_VAR layout
+	# on the installed root (base-files Makefile: real /var dir, only /var/run -> /tmp/run kept
+	# ephemeral; /etc/init.d/boot recreates /var/lock + /var/log at boot). Done AFTER apk (which
+	# needs the /var->/tmp symlink for its transient cache/locks) and before the ceremony, whose
+	# sbctl writes keys under /var/lib/sbctl and must persist.
+	rm -f "$TARGET/var"
+	mkdir -p "$TARGET/var"
+	ln -s /tmp/run "$TARGET/var/run"
+}
+
+# ------------------------------------------------------------- configure
+configure_system(){
+	say "Configuring the system"
+	echo "$CFG_hostname" > "$TARGET/etc/hostname"
+	# root password / ssh key
+	if [ -n "$CFG_sshkey" ]; then
+		mkdir -p "$TARGET/etc/dropbear" "$TARGET/root/.ssh"
+		printf '%s\n' "$CFG_sshkey" > "$TARGET/root/.ssh/authorized_keys"
+		printf '%s\n' "$CFG_sshkey" > "$TARGET/etc/dropbear/authorized_keys"
+		chmod 600 "$TARGET/root/.ssh/authorized_keys" "$TARGET/etc/dropbear/authorized_keys"
+	fi
+	[ -n "$CFG_password" ] && printf '%s\n%s\n' "$CFG_password" "$CFG_password" | chroot "$TARGET" passwd root >/dev/null 2>&1 || true
+
+	# Device apk feeds. base-files ships distfeeds.list (OpenWrt base + packages + target),
+	# which we keep: the target feed carries libc/dropbear/grub2/... that we do not rebuild,
+	# and our kernel + kmods out-rank OpenWrt's there by version, so the device installs
+	# ours. We only ADD our own feed, via customfeeds.list (base-files never regenerates
+	# that file, so it survives base-files upgrades).
+	mkdir -p "$TARGET/etc/apk/repositories.d"
+	{
+		echo "$RWRT_REL/snapshot/packages.adb"
+		for b in 1 2 3; do echo "$RWRT_REL/snapshot-kmods-$b/packages.adb"; done
+	} > "$TARGET/etc/apk/repositories.d/customfeeds.list"
+	# the install-time top-level list is redundant now; the .d/ lists drive apk on-device
+	: > "$TARGET/etc/apk/repositories"
+
+	# fstab: the ESP (the initramfs finds the LUKS root itself via the cmdline)
+	esp_uuid="$(blkid -s UUID -o value "$CFG_esp")"
+	{
+		echo "UUID=$esp_uuid  /boot/efi  vfat  ro,noatime  0 2"
+	} >> "$TARGET/etc/fstab"
+}
+
+# --------------------------------------------------------------- ceremony
+# Write uki.conf and run the on-device assembler + SB + TPM, inside the target.
+run_ceremony(){
+	say "Boot assembly (UKI, Secure Boot keys, TPM seal)"
+	kver="$(ls "$TARGET/lib/modules" 2>/dev/null | sort -V | tail -1)"
+	[ -n "$kver" ] || die "no kernel installed under $TARGET/lib/modules; base package set is wrong"
+	crypt=$([ "$CFG_encrypt" = yes ] && echo 1 || echo 0)
+	cmdline="rollingwrt.root=UUID=$ROOT_UUID rollingwrt.crypt=$crypt rollingwrt.name=$RWRT_MAPPER $CFG_cmdline_extra"
+	mkdir -p "$TARGET/etc/rollingwrt/keys"
+	# machine TPM policy-signing key (the boot seal trusts this key, not a raw PCR)
+	if [ "$CFG_encrypt" = yes ] && has_tpm; then
+		openssl genrsa -out "$TARGET/etc/rollingwrt/keys/tpm-policy.key" 2048 >/dev/null 2>&1
+	fi
+	cat > "$TARGET/etc/rollingwrt/uki.conf" <<-CONF
+		FIRMWARE=$CFG_firmware
+		KVER=$kver
+		CMDLINE="$cmdline"
+		ESP=/boot/efi
+		ESP_DISK=$CFG_disk
+		TPM_SIGN_KEY=/etc/rollingwrt/keys/tpm-policy.key
+		CRYPT=$crypt
+	CONF
+	# bind the host devices the ceremony needs (efivars for enroll, tpm for seal)
+	for m in dev proc sys; do mkdir -p "$TARGET/$m"; mount --bind "/$m" "$TARGET/$m"; done
+	mount --bind /sys/firmware/efi/efivars "$TARGET/sys/firmware/efi/efivars" 2>/dev/null || true
+	# 1. Secure Boot: create our PK/KEK/db, stage auto-enroll (+ Microsoft keys), sign
+	chroot "$TARGET" rollingwrt-secureboot enable || warn "secureboot enable reported a problem"
+	# 2. build + sign the UKI, install systemd-boot
+	chroot "$TARGET" rollingwrt-uki
+	# 3. seal the LUKS key to the TPM under the signed PCR-11 policy (install-time,
+	#    so first boot unlocks with no passphrase). Recovery passphrase on stdin.
+	if [ "$CFG_encrypt" = yes ] && has_tpm; then
+		printf '%s' "$CFG_passphrase" | chroot "$TARGET" rollingwrt-tpm-enroll "$CFG_root" || warn "TPM enroll failed; passphrase unlock still works"
+	fi
+	for m in sys/firmware/efi/efivars sys proc dev; do umount "$TARGET/$m" 2>/dev/null || true; done
+}
+
+finish(){
+	say "Done"
+	sync
+	umount "$TARGET/boot/efi" 2>/dev/null || true
+	umount "$TARGET" 2>/dev/null || true
+	[ "$CFG_encrypt" = yes ] && cryptsetup close "$RWRT_MAPPER" 2>/dev/null || true
+	cat <<-DONE
+
+	rollingWRT is installed on $CFG_disk.
+	  hostname   : $CFG_hostname
+	  encryption : $([ "$CFG_encrypt" = yes ] && echo "LUKS2$(has_tpm && echo ' + TPM auto-unlock')" || echo none)
+	  reach it   : ssh root@<its-ip>$([ -n "$CFG_sshkey" ] && echo ' (your key)' )
+
+	$( [ "$CFG_encrypt" = yes ] && printf '%s\n' "  KEEP YOUR RECOVERY PASSPHRASE. It is the only way in if the hardware changes." )
+	$( setup_mode || printf '%s\n' "  Secure Boot: enter firmware once, clear/erase the Secure Boot keys (Setup Mode); the next boot enrolls rollingWRT's keys automatically." )
+	Remove the install medium and reboot.
+	DONE
+}
+
+# ------------------------------------------------------------------- driver
+main(){
+	[ "$(id -u)" = 0 ] || die "run as root"
+	preflight
+	wizard
+	review_cmdline
+	confirm_destructive
+	partition
+	setup_target
+	deploy_apk
+	configure_system
+	run_ceremony
+	finish
+}
+
+# Only run when executed, not when sourced (image builders / tests source it).
+case "${0##*/}" in rollingwrt-install) main "$@";; esac

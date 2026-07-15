@@ -1,0 +1,41 @@
+#!/bin/sh
+# rollingwrt-kexec-install: jump straight into the rollingWRT installer from a
+# running Linux (a VPS with no console or ISO). It kexecs the self-contained
+# installer image (kernel + embedded initramfs + embedded base rootfs), which
+# comes up as a live installer; run rollingwrt-install there against the VPS disk.
+#
+#   rollingwrt-kexec-install [path-or-URL-to-rollingwrt-installer-initramfs-kernel.bin]
+#
+# With no argument it looks for the image next to this script or in the CWD. Fetches
+# over http(s) if given a URL. This REPLACES the running system with the installer;
+# make sure you can reach the machine's serial/VNC console afterwards.
+set -eu
+SRC="${1:-}"
+command -v kexec >/dev/null 2>&1 || { echo "kexec-tools is required (apt/apk install kexec-tools)" >&2; exit 1; }
+
+here="$(dirname "$0")"
+if [ -z "$SRC" ]; then
+	for c in "$here/rollingwrt-installer-initramfs-kernel.bin" \
+	         ./rollingwrt-installer-initramfs-kernel.bin; do
+		[ -f "$c" ] && { SRC="$c"; break; }
+	done
+	[ -n "$SRC" ] || { echo "usage: $0 <path-or-URL-to-installer-image>" >&2; exit 1; }
+fi
+
+BIN="$SRC"
+case "$SRC" in
+	http://*|https://*)
+		BIN="$(mktemp)"
+		echo "fetching $SRC ..."
+		if command -v curl >/dev/null 2>&1; then curl -fL "$SRC" -o "$BIN"
+		else wget -O "$BIN" "$SRC"; fi;;
+esac
+[ -s "$BIN" ] || { echo "installer image not found / empty: $BIN" >&2; exit 1; }
+
+# console=tty0 console=ttyS0 -> works on both a VGA console and a serial/IPMI one.
+CMDLINE="console=tty0 console=ttyS0"
+echo "loading installer via kexec ..."
+kexec -l "$BIN" --command-line="$CMDLINE"
+echo
+echo "Installer loaded. It will REPLACE this running system."
+echo "Run:  kexec -e     (or: systemctl kexec)   to enter the installer now."

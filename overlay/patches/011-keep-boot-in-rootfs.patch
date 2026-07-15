@@ -1,0 +1,11 @@
+diff --git a/include/rootfs.mk b/include/rootfs.mk
+--- a/include/rootfs.mk
++++ b/include/rootfs.mk
+@@ -116,7 +116,6 @@ define Image/mkfs/prepare/default
+ 	@-find $(1) -name .svn -o -name .git -o -name '.#*' | $(XARGS) rm -rf
+ 	rm -rf \
+-		$(1)/boot \
+ 		$(1)/tmp/* \
+ 		$(1)/lib/apk/db/*.post-install* \
+ 		$(1)/usr/lib/opkg/info/*.postinst* \
+ 		$(1)/usr/lib/opkg/lists/* \

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Sign the expected PCR-11 policy for a UKI, so TPM auto-unlock survives the
+# update. Runs on every kernel/UKI change (from rollingwrt-uki).
+#
+# PolicyAuthorize means we sign the policy DIGEST of the expected PCR 11, and the
+# TPM accepts any PCR 11 whose policy is signed by the machine key. The one hard
+# input is the expected PCR 11 for the NEW UKI: sd-stub measures the UKI's
+# sections (.linux .initrd .cmdline .osrel ...) into PCR 11 at boot, so we
+# PRE-COMPUTE that with rollingwrt-pcr11-predict (which reproduces our sd-stub's
+# measurement exactly). If the predicted PCR 11 were ever wrong the machine
+# safely falls back to the passphrase, it does not brick.
+set -eu
+UKI="${1:?uki path}"; SIGNKEY="${2:?policy signing key}"; SIGOUT="${3:?signature out}"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# 1. expected PCR 11 for this UKI (predictor emits the 64-char sha256 hex)
+hex="$(rollingwrt-pcr11-predict "$UKI")"
+
+# 2. build the PCR-11 policy digest for THAT (future) value in a trial session.
+#    tpm2_policypcr -f wants the raw PCR bytes, so convert hex -> 32 binary bytes.
+#    This is what makes update-survival work: we sign the policy for the NEXT UKI's
+#    PCR 11, computed offline, NOT the current live PCR.
+printf '%b' "$(printf '%s' "$hex" | sed 's/../\\x&/g')" > "$TMP/pcr11.bin"
+tpm2_startauthsession -S "$TMP/s.dat" >/dev/null
+tpm2_policypcr -S "$TMP/s.dat" -l "sha256:11" -f "$TMP/pcr11.bin" -L "$TMP/policy.digest"
+tpm2_flushcontext "$TMP/s.dat" >/dev/null
+
+# 3. sign the policy digest with the machine key -> the boot-time authorization
+openssl dgst -sha256 -sign "$SIGNKEY" -out "$SIGOUT" "$TMP/policy.digest"
+# the policy digest lives next to its signature on the ESP (same dir rollingwrt-uki made)
+cp "$TMP/policy.digest" "$(dirname "$SIGOUT")/pcr11.policy"
+echo "rollingwrt-tpm-sign-policy: signed PCR-11 policy -> $SIGOUT"

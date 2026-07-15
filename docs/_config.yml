@@ -1,0 +1,27 @@
+title: rollingWRT
+description: A distribution of OpenWrt for x86-64, with full-system rolling apk updates, a signed UKI, and TPM/LUKS auto-unlock.
+remote_theme: just-the-docs/just-the-docs
+url: https://cmspam.github.io
+baseurl: /rollingwrt
+
+permalink: pretty
+
+aux_links:
+  GitHub:
+    - https://github.com/cmspam/rollingwrt
+
+search_enabled: true
+search:
+  heading_level: 3
+  preview_words_before: 5
+  preview_words_after: 10
+
+heading_anchors: true
+color_scheme: dark
+
+footer_content: "<a href='https://github.com/cmspam/rollingwrt'>cmspam/rollingwrt</a>"
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-include-cache
