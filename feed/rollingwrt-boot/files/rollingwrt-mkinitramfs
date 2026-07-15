@@ -46,10 +46,15 @@ bundle() {   # bundle <path-to-binary>: copy it + its .so closure into the initr
 		if [ -f "$lib" ]; then install -D -m0755 "$lib" "$R$lib"; fi
 	done
 }
-for b in busybox cryptsetup blkid; do
+for b in busybox cryptsetup blkid kmod; do
 	p="$(command -v "$b" 2>/dev/null)" || continue
 	bundle "$p"
 done
+# OpenWrt's stripped busybox has no modprobe/insmod/mdev/blkid applets, so the gate uses
+# the real tools: kmod is modprobe+insmod (selected by argv[0]); blkid is bundled above.
+if [ -e "$R/usr/bin/kmod" ]; then
+	for t in modprobe insmod lsmod; do ( cd "$R/usr/bin" && ln -sf kmod "$t" ); done
+fi
 # tpm2-tools is one `tpm2` dispatcher binary + tpm2_* symlinks; copy the binary
 # ONCE and re-create the symlinks (installing each symlink would copy the whole
 # multi-MB binary per tool and bloat the UKI-embedded initrd).
@@ -77,8 +82,10 @@ fi
 # every busybox applet the /init gate invokes (uname is used for KVER; grep/head/
 # cut parse blkid output to resolve root=UUID= when there is no by-uuid symlink;
 # mktemp is used by rollingwrt-tpm-unseal, which runs INSIDE the gate).
-for a in mount switch_root modprobe insmod poweroff mdev sleep cat ls mknod uname rm mkdir \
-         grep head cut sed blkid dmesg mktemp; do
+# only applets OpenWrt's busybox actually ships. modprobe/insmod (kmod), blkid, and the
+# device nodes are handled with the real tools / mknod, NOT busybox (it lacks those applets).
+for a in mount switch_root poweroff sleep cat ls mknod uname rm mkdir \
+         grep head cut sed dmesg mktemp; do
 	( cd "$R/bin" && ln -sf ../usr/bin/busybox "$a" ); done
 
 # the unlock modules for THIS kernel. aes/xts/gf128mul are for LUKS2's default

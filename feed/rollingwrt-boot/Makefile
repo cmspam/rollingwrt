@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=rollingwrt-boot
 PKG_VERSION:=1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=GPL-2.0-only
 
@@ -25,10 +25,13 @@ define Package/rollingwrt-boot
   CATEGORY:=Base system
   TITLE:=rollingWRT UKI + LUKS/TPM boot tooling
   # runtime deps for on-device UKI build/sign + TPM unlock
-  # bsdtar packs the initramfs cpio (OpenWrt's stock busybox has no cpio applet)
-  DEPENDS:=+cryptsetup +tpm2-tools +sbctl +efibootmgr +binutils +zstd +bsdtar \
+  # bsdtar packs the initramfs cpio (OpenWrt's stock busybox has no cpio applet); kmod is
+  # the real modprobe/insmod (busybox lacks those applets); kmod-fs-vfat lets the unlock
+  # gate mount the ESP read-only to read the signed PCR-11 policy for TPM auto-unlock.
+  DEPENDS:=+cryptsetup +tpm2-tools +sbctl +efibootmgr +binutils +zstd +bsdtar +kmod \
 	+openssl-util +libopenssl +systemd-boot +grub2 \
-	+kmod-dm +kmod-tpm +kmod-tpm-tis +kmod-tpm-crb +kmod-crypto-sha256
+	+kmod-dm +kmod-tpm +kmod-tpm-tis +kmod-tpm-crb +kmod-crypto-sha256 \
+	+kmod-fs-vfat +kmod-nls-cp437 +kmod-nls-iso8859-1
 endef
 
 define Package/rollingwrt-boot/description

@@ -20,6 +20,11 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
 [ -c /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
+# standard char devices the tools rely on (cryptsetup's RNG opens /dev/urandom); /dev is
+# not auto-populated here (busybox has no mdev applet, devtmpfs may be absent).
+for pair in "null 1 3" "zero 1 5" "random 1 8" "urandom 1 9"; do
+  set -- $pair; [ -e "/dev/$1" ] || mknod "/dev/$1" c "$2" "$3" 2>/dev/null
+done
 
 name=croot; root=; crypt=1; debug=
 for x in $(cat /proc/cmdline); do case "$x" in
@@ -35,16 +40,33 @@ for m in dax tpm tpm_tis_core tpm_tis tpm_crb sha256 hmac cbc aes_generic xts gf
          crypto_user af_alg algif_hash algif_skcipher fat vfat nls_cp437 nls_iso8859-1; do
   modprobe "$m" 2>/dev/null || { [ -f "/lib/modules/$KV/${m}.ko" ] && insmod "/lib/modules/$KV/${m}.ko" 2>/dev/null; } || true
 done
-busybox mdev -s 2>/dev/null
+# OpenWrt busybox has no mdev applet and devtmpfs may be absent, so /dev is not
+# auto-populated. Create the nodes we need directly (busybox does have mknod): block
+# devices from /proc/partitions, and the TPM char device (its module loaded above)
+# from /sys/class/tpm.
+while read -r maj min _ d; do
+  case "$maj" in ''|*[!0-9]*) continue;; esac
+  [ -n "$d" ] && [ ! -e "/dev/$d" ] && mknod "/dev/$d" b "$maj" "$min" 2>/dev/null
+done < /proc/partitions
+# (the TPM char node is created just before the unseal, once its module has registered)
 
 if [ -n "$debug" ]; then
   msg "DEBUG /proc/partitions:"; cat /proc/partitions > /dev/console 2>&1
-  msg "DEBUG blkid per block device:"
+  msg "DEBUG do the tools run?"
+  { cryptsetup --version; blkid --version 2>&1 | head -1; } > /dev/console 2>&1
+  msg "DEBUG per-device blkid -p UUID / cryptsetup luksUUID:"
   while read -r _ _ _ d; do
-    [ -n "$d" ] && [ -b "/dev/$d" ] && blkid "/dev/$d" > /dev/console 2>&1
+    [ -n "$d" ] && [ -b "/dev/$d" ] || continue
+    bu="$(blkid -p -s UUID -o value "/dev/$d" 2>&1)"
+    cu="$(cryptsetup luksUUID "/dev/$d" 2>&1)"
+    msg "  $d: blkid-p=[$bu] luksUUID=[$cu]"
   done < /proc/partitions
+  msg "DEBUG what is mounted on /dev:"; grep ' /dev ' /proc/mounts > /dev/console 2>&1
+  msg "DEBUG ls /dev (block nodes?):"; ls /dev > /dev/console 2>&1
   msg "DEBUG loaded crypto/alg modules:"; grep -E "alg|crypto|dm_|tpm" /proc/modules > /dev/console 2>&1
-  msg "DEBUG /dev tpm nodes:"; ls -l /dev/tpm* > /dev/console 2>&1
+  msg "DEBUG tpm sysfs + /dev nodes:"
+  { echo "class/tpm: $(ls /sys/class/tpm/ 2>&1)"; echo "class/tpmrm: $(ls /sys/class/tpmrm/ 2>&1)"; \
+    echo "tpmrm0/dev: $(cat /sys/class/tpmrm/tpmrm0/dev 2>&1)"; ls -l /dev/tpm* 2>&1; } > /dev/console 2>&1
 fi
 
 # resolve root device (UUID= or path). busybox blkid with NO args prints nothing;
@@ -56,11 +78,14 @@ case "$root" in
           rdev="/dev/disk/by-uuid/$uuid"          # present only if mdev made it
           if [ ! -b "$rdev" ]; then
             rdev=""
+            # match by UUID over /proc/partitions. blkid without -p relies on a cache
+            # dir the initramfs lacks (it then prints nothing), so probe with -p; for a
+            # LUKS container fall back to cryptsetup, which reads the header UUID directly.
             while read -r _ _ _ d; do
               [ -n "$d" ] && [ -b "/dev/$d" ] || continue
-              if blkid "/dev/$d" 2>/dev/null | grep -qF "UUID=\"$uuid\""; then
-                rdev="/dev/$d"; break
-              fi
+              du="$(blkid -p -s UUID -o value "/dev/$d" 2>/dev/null || true)"
+              [ -n "$du" ] || du="$(cryptsetup luksUUID "/dev/$d" 2>/dev/null || true)"
+              if [ "$du" = "$uuid" ]; then rdev="/dev/$d"; break; fi
             done < /proc/partitions
           fi
           ;;
@@ -83,13 +108,32 @@ else
   # it read-only here. Find it by content: the vfat partition that has our policy
   # dir. Without it, TPM unseal is skipped and the gate uses the passphrase.
   mkdir -p /esp
+  # try to mount each partition as vfat (no blkid: OpenWrt busybox lacks the applet and
+  # the standalone probe is unreliable in the initramfs). The ESP is the vfat that
+  # carries our policy dir; everything else fails to mount vfat or lacks the dir.
+  if [ -n "$debug" ]; then
+    modprobe vfat 2>/tmp/vpe
+    msg "DEBUG vfat: modprobe-rc=$? err=[$(cat /tmp/vpe 2>/dev/null)] loaded=[$(grep -cE '^vfat ' /proc/modules)] ko=[$(ls /lib/modules/"$KV"/fat.ko* /lib/modules/"$KV"/vfat.ko* /lib/modules/"$KV"/nls_cp437.ko* 2>&1)]"
+  fi
   for d in $(while read -r _ _ _ n; do [ -n "$n" ] && echo "$n"; done < /proc/partitions); do
     [ -b "/dev/$d" ] || continue
-    blkid "/dev/$d" 2>/dev/null | grep -qF 'TYPE="vfat"' || continue
-    if mount -t vfat -o ro "/dev/$d" /esp 2>/dev/null; then
+    mount -t vfat -o ro "/dev/$d" /esp 2>/tmp/me; mrc=$?
+    [ -n "$debug" ] && msg "DEBUG esp-try $d: mrc=$mrc err=[$(cat /tmp/me 2>/dev/null)] policy=[$(ls /esp/rollingwrt/pcr11.sig 2>&1)]"
+    if [ "$mrc" = 0 ]; then
       [ -f /esp/rollingwrt/pcr11.sig ] && break
       umount /esp 2>/dev/null || true
     fi
+  done
+  # the TPM char device can register a few seconds after its module loaded, and /dev is
+  # not auto-populated here; create /dev/tpmrm0 (+ tpm0) now, waiting briefly for sysfs.
+  i=0; while [ ! -e /sys/class/tpmrm/tpmrm0/dev ] && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done
+  [ -n "$debug" ] && msg "DEBUG tpm: waited=$i tpm_crb=$(grep -c tpm_crb /proc/modules) tpmrm=[$(ls /sys/class/tpmrm 2>&1)] devfile=[$(cat /sys/class/tpmrm/tpmrm0/dev 2>&1)]"
+  for s in /sys/class/tpm/tpm*/dev /sys/class/tpmrm/tpmrm*/dev; do
+    [ -e "$s" ] || continue
+    nm="${s%/dev}"; nm="${nm##*/}"     # basename/dirname are not busybox applets here
+    [ -n "$nm" ] || continue
+    [ -e "/dev/$nm" ] || mknod "/dev/$nm" c $(sed 's/:/ /' "$s") 2>/dev/null
+    [ -n "$debug" ] && msg "DEBUG mknod /dev/$nm -> [$(ls -l /dev/$nm 2>&1)]"
   done
   # 1. TPM unlock via signed PCR-11 policy (PolicyAuthorize). Survives kernel
   #    updates because the LUKS key is sealed to trust a public key, not a frozen
@@ -99,13 +143,15 @@ else
   # key is unsealed in userspace. Without this cryptsetup's default keyring path
   # makes the dm-crypt reload fail with EINVAL.
   if [ -x /usr/bin/rollingwrt-tpm-unseal ]; then
-    # keep the unseal's stderr (surfaced below under rollingwrt.debug): a silent
-    # failure here just falls through to the passphrase, which hid several real
-    # initramfs-only bugs (missing dlopen'd TCTI lib, missing mktemp, sig format).
-    if rollingwrt-tpm-unseal > /tmp/key 2>/tmp/tpm-unseal.err && [ -s /tmp/key ]; then
+    [ -n "$debug" ] && msg "DEBUG pre-unseal: esp=[$(ls /esp/rollingwrt 2>&1)] tpmrm0=[$(ls /dev/tpmrm0 2>&1)]"
+    rollingwrt-tpm-unseal > /tmp/key 2>/tmp/tpm-unseal.err; urc=$?
+    [ -n "$debug" ] && msg "DEBUG unseal: rc=$urc keysize=[$(wc -c < /tmp/key 2>/dev/null)] err=[$(cat /tmp/tpm-unseal.err 2>/dev/null)]"
+    if [ "$urc" = 0 ] && [ -s /tmp/key ]; then
       cryptsetup open --disable-keyring "$rdev" "$name" --key-file=/tmp/key && opened=1 && msg "TPM unlock OK"
     fi
     rm -f /tmp/key
+  else
+    [ -n "$debug" ] && msg "DEBUG rollingwrt-tpm-unseal NOT executable/present"
   fi
   # 2. Passphrase fallback (tamper / fresh device / TPM change). This is a LUKS
   #    keyslot secret, not a credential stored in A; it gates recovery only.
