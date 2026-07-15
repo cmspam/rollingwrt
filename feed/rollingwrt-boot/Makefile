@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=rollingwrt-boot
 PKG_VERSION:=1
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=GPL-2.0-only
 

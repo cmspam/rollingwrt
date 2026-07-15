@@ -16,7 +16,9 @@
 set -eu
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin   # run from installer chroot / first boot
 ROOT_PART="${1:?LUKS partition}"
-K=/etc/rollingwrt/keys; ESP="${ESP:-/esp}"
+# the ESP is mounted at /boot/efi on the installed/running system (and in the install
+# chroot); only the initramfs mounts it at /esp, and the enroll never runs there.
+K=/etc/rollingwrt/keys; ESP="${ESP:-/boot/efi}"
 PRIM=0x81000000; SEAL=0x81010001
 mkdir -p "$ESP/rollingwrt"
 
@@ -36,8 +38,10 @@ tpm2_policyauthorize -S /tmp/s.dat -L "$ESP/rollingwrt/authorized.policy" \
 tpm2_flushcontext /tmp/s.dat >/dev/null
 
 # recovery passphrase: the installer pipes it on stdin. Read it once so we can both
-# drop a slot a previous enroll left behind and authenticate the new luksAddKey.
-IFS= read -r PASS
+# drop a slot a previous enroll left behind and authenticate the new luksAddKey. The
+# `|| true` keeps `set -e` from aborting when the pipe has no trailing newline (read
+# still assigns PASS on EOF); without it the enroll dies here and never seals the key.
+IFS= read -r PASS || true
 SLOTFILE="$ESP/rollingwrt/tpm-keyslot"
 
 # idempotent re-enroll: if a prior run recorded its TPM keyslot, kill that slot
