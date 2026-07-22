@@ -1,0 +1,90 @@
+#!/bin/sh
+# rollingWRT Secure Boot: our OWN keys (PK/KEK/db), no shim, no MOK (the lanzaboote
+# model). sbctl generates the machine's keys and signs the UKI + sd-boot loader
+# with db. Enrollment is done by systemd-boot itself: we drop the signed key
+# databases in $ESP/loader/keys/auto/ and set loader.conf "secure-boot-enroll
+# force", so the FIRST boot with firmware in Setup Mode enrolls PK/KEK/db and then
+# comes up with Secure Boot enforcing on keys we own. Microsoft's db keys are kept
+# so signed option ROMs / other signed binaries still load.
+#
+#   rollingwrt-secureboot enable   create keys (if absent), sign loader+UKI, and
+#                                  stage the auto-enroll key databases on the ESP
+#   rollingwrt-secureboot enroll   enroll the keys NOW via efivars (needs Setup Mode)
+#   rollingwrt-secureboot sign     re-sign the current UKI + loader (on update)
+#   rollingwrt-secureboot status   report Secure Boot / Setup Mode state
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin   # run from installer chroot / apk trigger
+CMD="${1:-status}"
+CONF=/etc/rollingwrt/uki.conf
+if [ -f "$CONF" ]; then . "$CONF"; fi   # if-block: bare "&&" aborts ash under set -e
+ESP="${ESP:-/esp}"
+
+need(){ command -v sbctl >/dev/null 2>&1 || { echo "sbctl not installed" >&2; exit 1; }; }
+
+# Ensure efivarfs is mounted so a running UEFI system can read/write firmware vars.
+# OpenWrt does not auto-mount it (no systemd); our kernel builds it (CONFIG_EFIVAR_FS).
+# At install time run_ceremony already bind-mounts the host's efivarfs, so this no-ops.
+mount_efivars(){
+	[ -d /sys/firmware/efi ] || return 0                                   # not UEFI
+	grep -q ' /sys/firmware/efi/efivars ' /proc/mounts 2>/dev/null && return 0
+	mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+}
+
+setupmode(){ # 0 if firmware is in Setup Mode
+	mount_efivars
+	f=/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c
+	# The variable is [4-byte attributes][1-byte value]; the value is 1 in Setup Mode.
+	# busybox has no `od`; $(...) drops a trailing NUL (value 0) but keeps a 0x01 byte,
+	# so a non-empty last byte means Setup Mode.
+	[ -r "$f" ] && [ -n "$(tail -c1 "$f")" ]
+}
+
+sign_all(){ # sign every EFI binary on the ESP that firmware will load, record for re-sign
+	for f in "$ESP"/EFI/systemd/systemd-bootx64.efi "$ESP"/EFI/BOOT/BOOTX64.EFI "$ESP"/EFI/Linux/*.efi; do
+		if [ -f "$f" ]; then sbctl sign -s "$f" >/dev/null 2>&1 || true; fi
+	done
+}
+
+stage_autoenroll(){ # export our signed PK/KEK/db for systemd-boot to auto-enroll
+	# --export auth writes db.auth/KEK.auth/PK.auth (time-authenticated var updates)
+	# into the CWD; --microsoft keeps MS's db keys alongside ours. sd-boot reads
+	# these from loader/keys/auto/ when secure-boot-enroll=force and firmware is in
+	# Setup Mode. Keys live under /var/lib/sbctl (persistent /var), so they survive.
+	D="$ESP/loader/keys/auto"; mkdir -p "$D"
+	( cd "$D" && sbctl enroll-keys --microsoft --export auth >/dev/null 2>&1 ) || {
+		echo "rollingwrt-secureboot: WARNING could not export auto-enroll keys" >&2; return 1; }
+	# tell sd-boot to enroll them without prompting on a Setup-Mode boot
+	LC="$ESP/loader/loader.conf"
+	if [ ! -f "$LC" ] || ! grep -q '^secure-boot-enroll' "$LC" 2>/dev/null; then
+		printf 'secure-boot-enroll force\n' >> "$LC"
+	fi
+	echo "rollingwrt-secureboot: staged auto-enroll keys at $D (db,KEK,PK).auth"
+}
+
+enroll(){ # immediate enroll via efivars (alternative to sd-boot auto-enroll)
+	need
+	setupmode || { echo "firmware is NOT in Setup Mode; enter it in firmware setup, then rerun" >&2; exit 1; }
+	sbctl enroll-keys --microsoft --yes-this-might-brick-my-machine
+	echo "rollingwrt-secureboot: own keys enrolled via efivars; reboot to enforce."
+}
+
+enable(){
+	need
+	sbctl create-keys 2>/dev/null || true    # idempotent: no-op if keys exist
+	sign_all
+	stage_autoenroll
+	if setupmode; then
+		echo "rollingwrt-secureboot: firmware is in Setup Mode - reboot and sd-boot will enroll your keys, then Secure Boot enforces."
+	else
+		echo "rollingwrt-secureboot: keys generated, boot files signed, auto-enroll staged."
+		echo "Put firmware in Setup Mode and reboot; sd-boot enrolls your keys automatically."
+	fi
+}
+
+case "$CMD" in
+	enable) enable;;
+	enroll) enroll;;
+	sign)   need; sign_all; echo "signed.";;
+	status) mount_efivars; command -v sbctl >/dev/null 2>&1 && sbctl status 2>/dev/null || echo "sbctl unavailable";;
+	*) echo "usage: rollingwrt-secureboot {enable|enroll|sign|status}" >&2; exit 1;;
+esac

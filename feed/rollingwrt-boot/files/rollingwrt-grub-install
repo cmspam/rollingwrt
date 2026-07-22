@@ -1,0 +1,68 @@
+#!/bin/sh
+# rollingWRT BIOS boot setup (the non-UEFI path). Where UEFI gets a signed UKI +
+# systemd-boot, a legacy-BIOS machine gets GRUB in the MBR loading the kernel +
+# our unlock initramfs from the ESP (FAT, so GRUB can read it even when root is
+# LUKS). No UKI, no Secure Boot (BIOS has none); LUKS is unlocked by the same
+# initramfs gate, by passphrase (no TPM measured-boot chain on BIOS).
+#
+# Runs on install and on every kernel change (rollingwrt-boot trigger, BIOS branch).
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin   # run from installer chroot / apk trigger
+DISK="${1:?target disk}"
+CONF=/etc/rollingwrt/uki.conf
+. "$CONF"                                     # CMDLINE, CRYPT, ESP, ESP_DISK, ESP_LABEL
+. /usr/lib/rollingwrt/esp-mount.sh            # esp_mount / esp_umount (ESP is not mounted at runtime)
+
+KVER="$(ls /lib/modules | sort -V | tail -1)"
+KERNEL="/boot/vmlinuz-$KVER"; [ -f "$KERNEL" ] || KERNEL=/boot/vmlinuz
+ESP="${ESP:-/esp}"
+trap 'esp_umount' EXIT
+# the ESP is not mounted while the system runs; mount it read-write so the kernel,
+# initramfs and grub.cfg below land on the real boot partition
+esp_mount || { echo "rollingwrt-grub-install: ESP unavailable; boot NOT updated" >&2; exit 1; }
+mkdir -p "$ESP/rollingwrt" "$ESP/boot/grub"
+
+echo "rollingwrt-grub-install: kernel $KVER -> $DISK (BIOS)"
+
+# 1. kernel + unlock initramfs onto the ESP (readable pre-unlock)
+rollingwrt-mkinitramfs "$KVER" "$ESP/rollingwrt/initrd.cpio.zst"
+cp "$KERNEL" "$ESP/rollingwrt/vmlinuz"
+
+# 2. GRUB into the MBR via grub-bios-setup. OpenWrt ships no grub-install and no
+# i386-pc modules in the rootfs, so we use the self-contained core image the grub2
+# package built (rollingwrt-boot ships it at $GRUB/core.img with fat + part_gpt +
+# linux baked in) plus the MBR boot.img. Its embedded early config is
+# `configfile (hd0,gpt1)/boot/grub/grub.cfg`, so grub reads the config below off
+# the ESP (GPT partition 1) with no modules on disk. -r gives the root hint.
+GRUB=/usr/lib/rollingwrt/grub
+[ -f "$GRUB/core.img" ] && [ -f "$GRUB/boot.img" ] || {
+	echo "rollingwrt-grub-install: missing grub core/boot image in $GRUB" >&2; exit 1; }
+SU=/tmp/rollingwrt-grub-setup; rm -rf "$SU"; mkdir -p "$SU"
+cp "$GRUB/boot.img" "$SU/boot.img"
+cp "$GRUB/core.img" "$SU/core.img"
+echo "(hd0) $DISK" > "$SU/device.map"
+grub-bios-setup -m "$SU/device.map" -d "$SU" -r "hd0,gpt1" "$DISK"
+rm -rf "$SU"
+
+# 3. a single static entry (no menu, no rollback: reinstall behind the passphrase).
+# fat/part_gpt/linux are already in the core image, so no insmod is needed here;
+# grub loads a zstd initramfs as-is and the kernel (CONFIG_RD_ZSTD) decompresses it.
+# `set root=(hd0,gpt1)` is required: the core image's embedded config sources this
+# file from (hd0,gpt1) but does NOT carry $root into it, so without this the linux
+# line fails with "unknown filesystem". gpt1 is the ESP (BIOS install is whole-disk
+# only). serial + terminal lines make the boot menu visible over the serial console
+# the appliance is driven from (console still works on a monitor via tty0).
+cat > "$ESP/boot/grub/grub.cfg" <<EOF
+serial --unit=0 --speed=115200
+terminal_input serial console
+terminal_output serial console
+set root=(hd0,gpt1)
+set timeout=1
+set default=0
+menuentry "rollingWRT" {
+	linux /rollingwrt/vmlinuz $CMDLINE
+	initrd /rollingwrt/initrd.cpio.zst
+}
+EOF
+
+echo "rollingwrt-grub-install: installed GRUB + kernel on $ESP"

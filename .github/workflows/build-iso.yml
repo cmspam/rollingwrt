@@ -1,0 +1,77 @@
+name: Build installer ISO
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly. The ISO rarely changes: it pulls the system from our feed at
+    # install time, so a stale ISO still installs the latest packages.
+    - cron: '0 3 * * 0'
+  push:
+    branches: [main]
+    paths:
+      - 'installer/rollingwrt-install'
+      - 'installer/rollingwrt-common.sh'
+      - 'installer/fedora-live/**'
+      - 'installer/keys/**'
+      - '.github/workflows/build-iso.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-iso:
+    name: Build installer ISO
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+      options: --privileged
+    steps:
+      - name: Install build deps
+        run: |
+          dnf install -y \
+            dnf dracut squashfs-tools xorriso mtools dosfstools e2fsprogs \
+            util-linux openssl curl which git gh tar \
+            grub2-tools grub2-pc-modules grub2-efi-x64 syslinux
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build ISO
+        working-directory: installer/fedora-live
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          chmod +x build-iso.sh
+          ./build-iso.sh out
+
+      - name: Publish ISO to the installer release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISO="$(ls installer/fedora-live/out/*.iso | head -1)"
+          SIZE="$(du -h "$ISO" | cut -f1)"
+          SHA="$(sha256sum "$ISO" | awk '{print $1}')"
+          NOTES="rollingWRT installer.
+
+          Boot this ISO (UEFI or legacy BIOS; Secure Boot is supported) and run
+          \`rollingwrt-install\` to install rollingWRT onto a disk. The installer
+          partitions the disk, installs the system, and can set up an encrypted
+          root that unlocks automatically with the machine's TPM.
+
+          - Size: ${SIZE}
+          - SHA-256: \`${SHA}\`"
+          if ! gh release view installer --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create installer --repo "$GITHUB_REPOSITORY" \
+              --title "rollingWRT installer" --notes "$NOTES"
+          else
+            gh release edit installer --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          fi
+          # The ISO name carries a date, so --clobber alone would leave older dated ISOs
+          # behind. Remove every previously published .iso first so only the current one
+          # exists on the release.
+          for a in $(gh release view installer --repo "$GITHUB_REPOSITORY" \
+                       --json assets -q '.assets[].name' 2>/dev/null | grep '\.iso$' || true); do
+            gh release delete-asset installer "$a" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          done
+          gh release upload installer "$ISO" --repo "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,162 @@
+#!/bin/sh
+# rollingWRT unlock stub (initramfs /init).
+#
+# This is the "A" gate: it can unlock the encrypted root ("B") unattended, and it
+# carries NO authority of its own. So it exposes NO management interface. Its only
+# outcomes are: (1) unlock B and immediately pivot; (2) prompt for the LUKS
+# passphrase; (3) HALT. It never drops to a shell and a failure never
+# out-privileges success. Cmdline is inside the signed, measured UKI.
+#
+# cmdline (rollingwrt.*):
+#   rollingwrt.root=UUID=...    LUKS (or plain, if crypt=0) root
+#   rollingwrt.crypt=0          root is not encrypted (VM / no-TPM path)
+#   rollingwrt.name=croot       dm-crypt mapper name
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export LD_LIBRARY_PATH=/lib:/lib64:/usr/lib:/usr/lib64
+msg(){ echo "[rollingwrt] $*" > /dev/console 2>&1; }
+halt_gate(){ msg "UNLOCK FAILED: $*"; msg "halting (no recovery shell by design)"; sleep 5; poweroff -f; }
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
+[ -c /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
+# standard char devices the tools rely on (cryptsetup's RNG opens /dev/urandom); /dev is
+# not auto-populated here (busybox has no mdev applet, devtmpfs may be absent).
+for pair in "null 1 3" "zero 1 5" "random 1 8" "urandom 1 9"; do
+  set -- $pair; [ -e "/dev/$1" ] || mknod "/dev/$1" c "$2" "$3" 2>/dev/null
+done
+
+name=croot; root=; crypt=1; tpm=1
+for x in $(cat /proc/cmdline); do case "$x" in
+  rollingwrt.root=*)  root="${x#rollingwrt.root=}";;
+  rollingwrt.name=*)  name="${x#rollingwrt.name=}";;
+  rollingwrt.crypt=*) crypt="${x#rollingwrt.crypt=}";;
+  rollingwrt.tpm=*)   tpm="${x#rollingwrt.tpm=}";;
+esac; done
+
+KV="$(uname -r)"
+for m in dax tpm tpm_tis_core tpm_tis tpm_crb sha256 hmac cbc aes_generic xts gf128mul \
+         trusted encrypted-keys dm-mod dm-crypt \
+         crypto_user af_alg algif_hash algif_skcipher fat vfat nls_cp437 nls_iso8859-1; do
+  modprobe "$m" 2>/dev/null || { [ -f "/lib/modules/$KV/${m}.ko" ] && insmod "/lib/modules/$KV/${m}.ko" 2>/dev/null; } || true
+done
+# OpenWrt busybox has no mdev applet and devtmpfs may be absent, so /dev is not
+# auto-populated. Create the nodes we need directly (busybox does have mknod): block
+# devices from /proc/partitions, and the TPM char device (its module loaded above)
+# from /sys/class/tpm.
+while read -r maj min _ d; do
+  case "$maj" in ''|*[!0-9]*) continue;; esac
+  [ -n "$d" ] && [ ! -e "/dev/$d" ] && mknod "/dev/$d" b "$maj" "$min" 2>/dev/null
+done < /proc/partitions
+# (the TPM char node is created just before the unseal, once its module has registered)
+
+# resolve root device (UUID= or path). busybox blkid with NO args prints nothing;
+# it must be given a device. So probe each block device from /proc/partitions.
+# (init has no set -e, so the "&& break" pattern here is safe.)
+rdev=""
+case "$root" in
+  UUID=*) uuid="${root#UUID=}"
+          rdev="/dev/disk/by-uuid/$uuid"          # present only if mdev made it
+          if [ ! -b "$rdev" ]; then
+            rdev=""
+            # match by UUID over /proc/partitions. blkid without -p relies on a cache
+            # dir the initramfs lacks (it then prints nothing), so probe with -p; for a
+            # LUKS container fall back to cryptsetup, which reads the header UUID directly.
+            while read -r _ _ _ d; do
+              [ -n "$d" ] && [ -b "/dev/$d" ] || continue
+              du="$(blkid -p -s UUID -o value "/dev/$d" 2>/dev/null || true)"
+              [ -n "$du" ] || du="$(cryptsetup luksUUID "/dev/$d" 2>/dev/null || true)"
+              if [ "$du" = "$uuid" ]; then rdev="/dev/$d"; break; fi
+            done < /proc/partitions
+          fi
+          ;;
+  /dev/*) rdev="$root";;
+esac
+[ -b "$rdev" ] || halt_gate "root device $root not found"
+
+if [ "$crypt" = "0" ]; then
+  target="$rdev"
+else
+  opened=0
+  # TPM auto-unlock (rollingwrt.tpm=1). When it is off - the user chose to enter the
+  # passphrase at every boot - skip the whole TPM path and go straight to the prompt.
+  if [ "$tpm" = "1" ]; then
+    # The signed PCR-11 policy (pcr11.sig/pcr11.policy/policy.name/tpm-policy.pub) lives
+    # on the ESP. sd-stub reads the UKI via EFI, but Linux does not auto-mount the ESP, so
+    # mount it read-only here; rollingwrt-tpm-unseal reads the policy IN PLACE from
+    # $ESP/rollingwrt/. It is released before switch_root. Do NOT copy the files elsewhere:
+    # this initramfs busybox ships no `cp` applet, so a copy silently fails and the unseal
+    # then finds no policy and falls back to the passphrase. The read-only mount that is
+    # left until switch_root orphans the ESP superblock, but rollingwrt-uki handles that
+    # (it mounts read-only then remounts read-write). Find it by content: the vfat
+    # partition that carries our policy dir.
+    mkdir -p /esp
+    # try to mount each partition as vfat (no blkid: OpenWrt busybox lacks the applet and
+    # the standalone probe is unreliable in the initramfs). The ESP is the vfat that
+    # carries our policy dir; everything else fails to mount vfat or lacks the dir.
+    for d in $(while read -r _ _ _ n; do [ -n "$n" ] && echo "$n"; done < /proc/partitions); do
+      [ -b "/dev/$d" ] || continue
+      mount -t vfat -o ro "/dev/$d" /esp 2>/dev/null; mrc=$?
+      if [ "$mrc" = 0 ]; then
+        [ -f /esp/rollingwrt/pcr11.sig ] && break
+        umount /esp 2>/dev/null || true
+      fi
+    done
+    # the TPM char device can register a few seconds after its module loaded, and /dev is
+    # not auto-populated here; create /dev/tpmrm0 (+ tpm0) now, waiting briefly for sysfs.
+    i=0; while [ ! -e /sys/class/tpmrm/tpmrm0/dev ] && [ "$i" -lt 15 ]; do i=$((i+1)); sleep 1; done
+    for s in /sys/class/tpm/tpm*/dev /sys/class/tpmrm/tpmrm*/dev; do
+      [ -e "$s" ] || continue
+      nm="${s%/dev}"; nm="${nm##*/}"     # basename/dirname are not busybox applets here
+      [ -n "$nm" ] || continue
+      [ -e "/dev/$nm" ] || mknod "/dev/$nm" c $(sed 's/:/ /' "$s") 2>/dev/null
+    done
+    # Warm-up: the resource-manager char device can exist before the TPM actually
+    # answers commands (emulated/firmware TPMs are slow to come up), so the first
+    # unseal can fail even though the policy is valid. Poll a cheap read until the
+    # TPM responds, up to ~20s, before attempting the unseal.
+    i=0; while ! tpm2_pcrread sha256:11 >/dev/null 2>&1 && [ "$i" -lt 20 ]; do i=$((i+1)); sleep 1; done
+    # TPM unlock via signed PCR-11 policy (PolicyAuthorize). Survives kernel updates
+    # because the LUKS key is sealed to trust a public key, not a frozen PCR; each UKI
+    # carries a policy signed for its own PCR 11.
+    # --disable-keyring: keep the volume key OUT of the kernel keyring (put it in the
+    # dm table directly). By design we do not use trusted/encrypted keyring keys; the
+    # key is unsealed in userspace. Without this cryptsetup's default keyring path
+    # makes the dm-crypt reload fail with EINVAL.
+    if [ -x /usr/bin/rollingwrt-tpm-unseal ]; then
+      # rollingwrt-tpm-unseal reads the policy from /esp (still mounted). retry a few
+      # times: a transient TPM busy/slow response should not fall all the way through to
+      # the passphrase when the seal is valid.
+      utry=0
+      while [ "$utry" -lt 3 ] && [ "$opened" = "0" ]; do
+        rollingwrt-tpm-unseal > /tmp/key 2>/tmp/tpm-unseal.err; urc=$?
+        if [ "$urc" = 0 ] && [ -s /tmp/key ]; then
+          cryptsetup open --disable-keyring "$rdev" "$name" --key-file=/tmp/key && opened=1 && msg "TPM unlock OK"
+        fi
+        rm -f /tmp/key
+        [ "$opened" = "1" ] || { utry=$((utry+1)); sleep 1; }
+      done
+    fi
+  fi
+  # Passphrase: the primary unlock when TPM auto-unlock is off, and the fallback when it
+  # is on but did not open the disk (tamper / fresh device / TPM change). This is a LUKS
+  # keyslot secret, not a credential stored in A; it gates recovery only.
+  if [ "$opened" = "0" ]; then
+    tries=0
+    while [ "$tries" -lt 3 ]; do
+      [ "$tpm" = "1" ] && msg "TPM unlock unavailable - enter LUKS passphrase:" || msg "enter LUKS passphrase:"
+      if cryptsetup open --disable-keyring "$rdev" "$name" < /dev/console; then opened=1; break; fi
+      tries=$((tries+1))
+    done
+  fi
+  rm -f /tmp/tpm-unseal.err
+  [ "$opened" = "1" ] || halt_gate "could not unlock $rdev"
+  umount /esp 2>/dev/null || true   # safety: the ESP was already released after the policy copy
+  target="/dev/mapper/$name"
+fi
+
+mount -o rw "$target" /newroot || halt_gate "mount $target failed"
+[ -x /newroot/sbin/init ] || halt_gate "no /sbin/init on root"
+for f in proc sys dev; do mount --move "/$f" "/newroot/$f" 2>/dev/null || true; done
+exec switch_root /newroot /sbin/init
+halt_gate "switch_root returned"

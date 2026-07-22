@@ -1,0 +1,20 @@
+# rollingWRT: disable OpenWrt's unauthenticated failsafe root shell.
+#
+# On a stock flash router the failsafe "press f" shell is a harmless recovery aid, but
+# rollingWRT auto-unlocks an encrypted root through the TPM, so a passwordless failsafe
+# shell at the console would hand the decrypted filesystem to anyone standing at it.
+# OpenWrt's preinit gates failsafe (the f-key prompt AND a failsafe= cmdline) on this
+# variable. base-files ships it empty and we install base-files from OpenWrt's feed rather
+# than building it ourselves, so the image-time CONFIG_TARGET_PREINIT_DISABLE_FAILSAFE does
+# not reach the device; set it here instead. Sourced after 00_preinit.conf (which sets it
+# empty) and before the failsafe hooks run, so this value wins.
+pi_preinit_no_failsafe=y
+
+# Even with failsafe disabled, OpenWrt's failsafe_wait hook (30_failsafe_wait, sourced
+# before this fragment) still runs to offer the "press [1][2][3][4] for a debug level"
+# prompt, which reads every active console (/dev/ttyS0 AND /dev/tty0 on a serial box).
+# During preinit one of those consoles is not readable yet, so the read fails and the
+# shell prints a bare "sh: I/O error". rollingWRT has no failsafe and no use for the
+# debug-level prompt, so replace the hook with a no-op. This shadows the earlier
+# definition (the preinit hook list calls it by name), so no vendor file is edited.
+failsafe_wait() { return 0; }
