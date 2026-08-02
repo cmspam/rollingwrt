@@ -10,6 +10,8 @@
 #   kmod-vhost-vsock - its source is the kernel shipped by the target OpenWrt
 #                      SDK, not an upstream release; scripts/sync-kmod-src.sh
 #                      refreshes it when the OpenWrt version changes.
+# The build runs this at the start of every daily run and commits the result, so a
+# package is at most one day behind its upstream release.
 set -euo pipefail
 FEED="${FEED:-$(cd "$(dirname "$0")/../feed" && pwd)}"
 
@@ -48,6 +50,8 @@ bump_incus() {
 	set_ver_hash incus "$new" "$(url_sha256 "https://github.com/lxc/incus/releases/download/v$new/incus-$new.tar.gz")"
 	# PKG_BUILD_DIR is pinned to the major.minor (incus-X.Y); keep it in step.
 	sed -i "s#^PKG_BUILD_DIR:=.*#PKG_BUILD_DIR:=\$(BUILD_DIR)/incus-${new%.*}#" "$FEED/incus/Makefile"
+	# incus-vm is a metapackage over the same release; it carries incus's version.
+	sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$new/" "$FEED/incus-vm/Makefile"
 	echo "incus $old -> $new"
 }
 
@@ -77,10 +81,14 @@ bump_zfs() {
 	echo "zfs $old -> $tag"
 }
 
-# --- qemu: newest 11.x tarball on download.qemu.org ---
+# --- qemu: newest release tarball on download.qemu.org. The digits-only match skips the
+#     rc/alpha names, so this only ever picks a final release. feed/qemu is OpenWrt's
+#     recipe plus our native-context flags and it runs ahead of the version OpenWrt ships,
+#     so a point release is routine but a major bump can need the recipe re-synced from
+#     the snapshot's feeds/packages/utils/qemu (re-applying the virgl flags). ---
 bump_qemu() {
 	local new old; old="$(cur_ver qemu)"
-	new="$(curl -fsSL https://download.qemu.org/ | sed -n 's/.*qemu-\(11\.[0-9.]*\)\.tar\.xz".*/\1/p' | sort -V | tail -1)"
+	new="$(curl -fsSL https://download.qemu.org/ | sed -n 's/.*qemu-\([0-9][0-9.]*\)\.tar\.xz".*/\1/p' | sort -V | tail -1)"
 	[ -n "$new" ] && [ "$new" != "$old" ] || return 0
 	set_ver_hash qemu "$new" "$(url_sha256 "https://download.qemu.org/qemu-$new.tar.xz")"
 	echo "qemu $old -> $new"
@@ -91,8 +99,4 @@ bump_github_tarball cowsql-raft cowsql/raft   "https://codeload.github.com/cowsq
 bump_zfs
 bump_incus
 bump_incus_ui
-# qemu is NOT bumped here: our feed/qemu is OpenWrt's OFFICIAL recipe + our
-# native-context flags, so it tracks the pinned snapshot's qemu version (which
-# builds cleanly with python3-host.mk). Independently jumping to the newest 11.x
-# reintroduces a host-python/setuptools break. Re-sync feed/qemu from the
-# snapshot's feeds/packages/utils/qemu (re-applying the virgl flags) on a pin bump.
+bump_qemu

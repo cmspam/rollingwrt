@@ -7,14 +7,18 @@
 # the packages against OpenWrt's official SDK download. OpenWrt publishes those ONLY for
 # the newest snapshot, so the source, the toolchain and the SDK must all come from the
 # same snapshot - the one named in the target's version.buildinfo. We read it live here;
-# config/SNAPSHOT_PIN is no longer the build pin (update.yml still records it).
+# config/SNAPSHOT_PIN is no longer the build pin (the build's update job still records it).
 #
 # Gating signals, compared against the last published build (the snapshot release's
 # manifest.json, written by the build's index job):
 #   kernel : the snapshot's x86 target kernel version. When it moves, the kernel and
 #            every kmod are ABI-invalidated - rebuild the kernel track and zfs (its kmod).
-#   <pkg>  : the PKG_VERSION pinned in our feed Makefile (update.yml bumps these to latest
-#            upstream on its own cadence and commits, which triggers a forced push build).
+#   <pkg>  : the version of EVERY package in feed/, as build/feed-versions.sh reports it.
+#            The build's update job bumps these to latest upstream and commits before this
+#            runs, so a bump lands in the same run that builds it.
+# Gating on every feed package, rather than a chosen few, is what makes the daily build
+# self-healing: a bump whose build failed leaves manifest.json untouched, so the next run
+# sees the same difference and retries it instead of dropping it silently.
 # A push rebuilds ONLY the tracks whose files it changed (git diff of the push): a change
 # under feed/incus rebuilds the incus track, not the ~1.5h kernel. A change to shared build
 # glue (build/*.sh, Containerfile, .github, overlay) rebuilds everything, since it can affect
@@ -22,7 +26,7 @@
 # rebuilds every track; a dispatch without `force` is version-gated like the daily schedule.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # repo/
-FEED="${FEED:-$HERE/feed}"
+export FEED="${FEED:-$HERE/feed}"     # build/feed-versions.sh reads it
 BASE="${OPENWRT_SNAPSHOT_BASE:-https://downloads.openwrt.org/snapshots/targets/x86/64}"
 GH_RAW="https://raw.githubusercontent.com/openwrt/openwrt"
 REPO_SLUG="${REPO_SLUG:-cmspam/rollingwrt}"
@@ -35,9 +39,6 @@ AFTER="${AFTER:-HEAD}"   # push only: the pushed commit (github.sha)
 out() { [ -n "${GITHUB_OUTPUT:-}" ] && echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "resolve: $1=$2" >&2; }
 jget() { # json-text key -> value ("" if absent)
 	printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
-}
-feedver() { # package -> its feed Makefile PKG_VERSION ("" if absent)
-	sed -n 's/^PKG_VERSION[[:space:]]*[:?]*=[[:space:]]*//p' "$FEED/$1/Makefile" 2>/dev/null | head -1
 }
 
 # --- pin: the published snapshot (source + toolchain + SDK all aligned) ----------
@@ -61,6 +62,30 @@ out kernel_version "$kernel_now"
 # --- gate ------------------------------------------------------------------------
 manifest="$(curl -sfL "$MANIFEST_URL" 2>/dev/null || true)"
 
+# Which job builds a given feed package. Every directory in feed/ must appear here; one
+# that does not forces a full rebuild rather than being quietly left out.
+track_of() {
+	case "$1" in
+	rollingwrt-kernel)                                       echo kernel ;;
+	zfs)                                                     echo zfs ;;
+	virglrenderer|qemu|qemu-firmware-edk2|numactl|usbredir)   echo gpu ;;
+	cowsql|cowsql-raft|incus|incus-ui|incus-ui-proxy|luci-app-incus|incus-vm)
+	                                                         echo main ;;
+	systemd-boot|tpm2-tss|tpm2-tools|sbctl|rollingwrt-boot)   echo main ;;   # the boot job shares the main gate
+	*)                                                       echo "" ;;
+	esac
+}
+
+need_kernel=false; need_zfs=false; need_gpu=false; need_main=false
+mark() {
+	case "$1" in
+	kernel) need_kernel=true ;;
+	zfs)    need_zfs=true; need_kernel=true ;;   # zfs userland here, its kmod in the kernel job
+	gpu)    need_gpu=true ;;
+	main)   need_main=true ;;
+	esac
+}
+
 # forced = rebuild every track. A manual dispatch with force=true, or the first ever build
 # (no manifest to diff against), forces all. A push instead gates per track by the files it
 # changed (below); only a push touching shared build glue escalates to forced.
@@ -72,7 +97,6 @@ forced=false
 # Version-gating (below) catches UPSTREAM moves (a new snapshot, a bumped PKG_VERSION) but
 # not edits to our own recipes/scripts that leave the version string unchanged. So a push
 # also rebuilds any track whose files it touched.
-pt_kernel=false; pt_zfs=false; pt_gpu=false; pt_main=false
 if [ "$EVENT" = push ] && [ "$forced" != true ]; then
 	if [ -z "$BEFORE" ] || ! git -C "$HERE" rev-parse -q --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
 		forced=true                                     # no diff base (new branch/force-push): rebuild all
@@ -80,43 +104,52 @@ if [ "$EVENT" = push ] && [ "$forced" != true ]; then
 		while IFS= read -r f; do
 			[ -n "$f" ] || continue
 			case "$f" in
-				build/build.sh|build/Containerfile|build/ci-resolve.sh|build/gh-publish.sh|.github/*|overlay/*)
+				build/build.sh|build/Containerfile|build/ci-resolve.sh|build/gh-publish.sh|build/feed-versions.sh|.github/*|overlay/*)
 					forced=true ;;                          # shared glue: can affect every track
-				config/*)                    pt_kernel=true ;;
-				feed/zfs/*)                  pt_zfs=true; pt_kernel=true ;;   # userland here + its kmod in the kernel job
-				feed/virglrenderer/*|feed/qemu/*|feed/qemu-firmware-edk2/*|feed/numactl/*|feed/usbredir/*)
-					pt_gpu=true ;;
-				feed/cowsql/*|feed/cowsql-raft/*|feed/incus/*|feed/incus-ui/*|feed/incus-ui-proxy/*|feed/luci-app-incus/*|feed/incus-vm/*)
-					pt_main=true ;;
-				feed/systemd-boot/*|feed/tpm2-tss/*|feed/tpm2-tools/*|feed/sbctl/*|feed/rollingwrt-boot/*)
-					pt_main=true ;;                         # the boot job shares the build_main gate
-				feed/*)                      forced=true ;;    # an unrecognised feed package: rebuild all, never miss it
+				config/*)                    mark kernel ;;
+				feed/*)
+					p="${f#feed/}"; p="${p%%/*}"; t="$(track_of "$p")"
+					if [ -n "$t" ]; then mark "$t"; else forced=true; fi ;;   # unmapped package: rebuild all, never miss it
 				*) : ;;                                     # docs/planning/etc: nothing to build
 			esac
 		done < <(git -C "$HERE" diff --name-only "$BEFORE" "$AFTER" 2>/dev/null)
 	fi
 fi
 
-changed() { # key currentvalue path_touched -> "true" if forced, path-touched, or version differs
-	[ "$forced" = true ] && { echo true; return; }
-	{ [ "${3:-false}" = true ] || [ "$(jget "$manifest" "$1")" != "$2" ]; } && echo true || echo false
-}
-kernel_changed="$(changed kernel "$kernel_now" "$pt_kernel")"
-zfs_changed="$(changed zfs "$(feedver zfs)" "$pt_zfs")"
-qemu_changed="$(changed qemu "$(feedver qemu)" "$pt_gpu")"
-incus_changed="$(changed incus "$(feedver incus)" "$pt_main")"
-cowsql_changed="$(changed cowsql "$(feedver cowsql)" "$pt_main")"
+# --- version gate: every feed package + the kernel, against the last published build ---
+if [ "$forced" != true ]; then
+	versions="$(sh "$HERE/build/feed-versions.sh")"
+	while read -r pkg ver; do
+		[ -n "$pkg" ] || continue
+		old="$(jget "$manifest" "$pkg")"
+		[ "$old" = "$ver" ] && continue
+		t="$(track_of "$pkg")"
+		if [ -z "$t" ]; then
+			echo "resolve: $pkg is in feed/ with no track mapping; rebuilding everything" >&2
+			forced=true
+			continue
+		fi
+		echo "resolve: $pkg ${old:-none} -> $ver (track $t)" >&2
+		mark "$t"
+	done <<-EOF
+	$versions
+	EOF
+	if [ "$(jget "$manifest" kernel)" != "$kernel_now" ]; then
+		echo "resolve: kernel $(jget "$manifest" kernel) -> $kernel_now" >&2
+		mark kernel
+	fi
+fi
+
+[ "$forced" = true ] && { need_kernel=true; need_zfs=true; need_gpu=true; need_main=true; }
 
 # job gates. The kernel job builds the kernel + every kmod INCLUDING kmod-fs-zfs (against
-# our kernel), so it rebuilds on a kernel bump (ABI-invalidates every kmod) OR a zfs bump
-# (new module). The zfs USERLAND builds separately and depends only on the zfs version,
-# not the kernel; qemu/incus/boot userland likewise rebuild only on their own bump or a
-# forced run.
-yesno() { { [ "$1" = true ] || [ "$2" = true ]; } && echo 1 || echo 0; }
-build_kernel="$(yesno "$kernel_changed" "$zfs_changed")"
-build_zfs="$(yesno "$zfs_changed" false)"
-build_gpu="$(yesno "$qemu_changed" false)"
-build_main="$(yesno "$incus_changed" "$cowsql_changed")"
+# our kernel), so a zfs bump rebuilds it too (new module); mark() handles that. The zfs
+# USERLAND builds separately and depends only on the zfs version, not the kernel.
+yesno() { [ "$1" = true ] && echo 1 || echo 0; }
+build_kernel="$(yesno "$need_kernel")"
+build_zfs="$(yesno "$need_zfs")"
+build_gpu="$(yesno "$need_gpu")"
+build_main="$(yesno "$need_main")"
 out build_kernel "$build_kernel"
 out build_zfs "$build_zfs"
 out build_gpu "$build_gpu"

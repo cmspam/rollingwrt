@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=incus-vm
-PKG_VERSION:=7.2.0
+PKG_VERSION:=7.3.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=cmspam
@@ -12,7 +12,9 @@ include $(INCLUDE_DIR)/package.mk
 # Pure metapackage: the payload is the DEPENDS. It lives in its own source directory
 # (not incus/Makefile) so its +qemu DEPENDS stays out of incus/compile's prerequisite
 # graph. That keeps the container-only build track (main) free of the qemu/mesa/LLVM
-# pole; incus-vm is built and shipped by the gpu track, alongside qemu.
+# pole. No job compiles it: the build's index job reads the name, version and DEPENDS
+# from here and mkpkg's the apk directly, so the kmod DEPENDS are never built against
+# an SDK kernel. They resolve on-device from our feeds.
 define Package/incus-vm
   SECTION:=utils
   CATEGORY:=Utilities
