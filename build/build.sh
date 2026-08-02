@@ -126,6 +126,7 @@ gen_incus_vm() { # $1=buildroot(apk+key) $2=dest-dir
 	rel="$(sed -n 's/^PKG_RELEASE:=//p' "$mk" | head -1)"
 	deps="$(sed -n '/DEPENDS:=/,/[^\\]$/p' "$mk" | grep -oE '\+[a-zA-Z0-9_-]+' | tr -d '+' | tr '\n' ' ')"
 	[ -n "$ver" ] || return 0
+	rm -f "$2"/incus-vm-*.apk        # supersede the copy carried over from the previous feed
 	files="$(mktemp -d)"; mkdir -p "$files/usr/lib/incus"; echo vm > "$files/usr/lib/incus/vm-support"
 	[ -f "$1/private-key.pem" ] && sign=(--sign "$1/private-key.pem")
 	"$apk" mkpkg --info "name:incus-vm" --info "version:$ver-r${rel:-1}" --info "arch:x86_64" \

@@ -62,19 +62,10 @@ out kernel_version "$kernel_now"
 # --- gate ------------------------------------------------------------------------
 manifest="$(curl -sfL "$MANIFEST_URL" 2>/dev/null || true)"
 
-# Which job builds a given feed package. Every directory in feed/ must appear here; one
-# that does not forces a full rebuild rather than being quietly left out.
-track_of() {
-	case "$1" in
-	rollingwrt-kernel)                                       echo kernel ;;
-	zfs)                                                     echo zfs ;;
-	virglrenderer|qemu|qemu-firmware-edk2|numactl|usbredir)   echo gpu ;;
-	cowsql|cowsql-raft|incus|incus-ui|incus-ui-proxy|luci-app-incus|incus-vm)
-	                                                         echo main ;;
-	systemd-boot|tpm2-tss|tpm2-tools|sbctl|rollingwrt-boot)   echo main ;;   # the boot job shares the main gate
-	*)                                                       echo "" ;;
-	esac
-}
+# "<package> <version> <track>" for every package in feed/. The track mapping lives there
+# because the build's index job needs the same answer when it records the manifest.
+versions="$(sh "$HERE/build/feed-versions.sh")"
+track_of() { printf '%s\n' "$versions" | awk -v p="$1" '$1 == p { print $3 }'; }
 
 need_kernel=false; need_zfs=false; need_gpu=false; need_main=false
 mark() {
@@ -108,8 +99,11 @@ if [ "$EVENT" = push ] && [ "$forced" != true ]; then
 					forced=true ;;                          # shared glue: can affect every track
 				config/*)                    mark kernel ;;
 				feed/*)
-					p="${f#feed/}"; p="${p%%/*}"; t="$(track_of "$p")"
-					if [ -n "$t" ]; then mark "$t"; else forced=true; fi ;;   # unmapped package: rebuild all, never miss it
+					p="${f#feed/}"; p="${p%%/*}"
+					case "$(track_of "$p")" in
+					kernel|zfs|gpu|main) mark "$(track_of "$p")" ;;
+					*)                   forced=true ;;   # unmapped package: rebuild all, never miss it
+					esac ;;
 				*) : ;;                                     # docs/planning/etc: nothing to build
 			esac
 		done < <(git -C "$HERE" diff --name-only "$BEFORE" "$AFTER" 2>/dev/null)
@@ -118,19 +112,18 @@ fi
 
 # --- version gate: every feed package + the kernel, against the last published build ---
 if [ "$forced" != true ]; then
-	versions="$(sh "$HERE/build/feed-versions.sh")"
-	while read -r pkg ver; do
+	while read -r pkg ver track; do
 		[ -n "$pkg" ] || continue
 		old="$(jget "$manifest" "$pkg")"
 		[ "$old" = "$ver" ] && continue
-		t="$(track_of "$pkg")"
-		if [ -z "$t" ]; then
+		case "$track" in
+		kernel|zfs|gpu|main)
+			echo "resolve: $pkg ${old:-none} -> $ver (track $track)" >&2
+			mark "$track" ;;
+		*)
 			echo "resolve: $pkg is in feed/ with no track mapping; rebuilding everything" >&2
-			forced=true
-			continue
-		fi
-		echo "resolve: $pkg ${old:-none} -> $ver (track $t)" >&2
-		mark "$t"
+			forced=true ;;
+		esac
 	done <<-EOF
 	$versions
 	EOF
