@@ -388,8 +388,13 @@ if [ "$STAGE" = pkg ]; then
 	# which would rebuild them against the SDK kernel. A per-package compile builds just
 	# the package + its userland build-deps (libdrm, LLVM host, ...) and touches no kmods.
 	# ZFS_WITH_CONFIG (default all) lets the zfs userland job build user-space only.
+	# A parallel failure prints only "failed to build", so replay the failing package
+	# serially with V=sc to put the real compiler/configure error in the CI log.
 	for d in $PKG_DIRS; do
-		ZFS_WITH_CONFIG="${ZFS_WITH_CONFIG:-all}" make -j"$JOBS" "package/$d/compile"
+		ZFS_WITH_CONFIG="${ZFS_WITH_CONFIG:-all}" make -j"$JOBS" "package/$d/compile" && continue
+		echo ">>> $d failed; replaying with -j1 V=sc"
+		ZFS_WITH_CONFIG="${ZFS_WITH_CONFIG:-all}" make -j1 V=sc "package/$d/compile"
+		exit 1
 	done
 
 	# Drop kmods: no package job produces a kmod we publish (zfs's kmod-fs-zfs is built in
