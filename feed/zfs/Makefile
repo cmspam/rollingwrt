@@ -2,12 +2,12 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=zfs
-PKG_VERSION:=2.4.3
+PKG_VERSION:=2.4.4
 PKG_RELEASE:=1
 
 PKG_SOURCE:=zfs-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/openzfs/zfs/releases/download/zfs-$(PKG_VERSION)
-PKG_HASH:=1f08f2d154f5189b5f1382848a32667b3d34066145b474c49cd3d41a5fba59a7
+PKG_HASH:=2a3c70d55a37cc71618a95a60e81ad66530201eb118d37741dc92efcf848c8b1
 
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=CDDL-1.0
