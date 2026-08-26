@@ -6,9 +6,18 @@
 # Seed uploads take a while; gated rebuilds change few files and finish fast.
 #
 # Usage: GH_TOKEN=... gh-publish.sh <tag> <dir> [release title]
+#   PRUNE=1       delete superseded apks from the release (see prune_release below)
+#   PRUNE_SCOPE   space-separated dirs holding the REST of this build's apks, so an apk
+#                 stranded in a release this build no longer writes still counts as
+#                 superseded rather than as an unknown package to protect
+#   FORCE_UPLOAD  glob of basenames to re-upload even when name+size match
 set -uo pipefail
 TAG="${1:?tag}"; DIR="${2:?dir}"; TITLE="${3:-rollingWRT $TAG}"
 command -v gh >/dev/null || { echo "ERROR: gh not found" >&2; exit 1; }
+
+# GitHub rejects an upload once a release holds this many assets, with
+# HTTP 422 "file_count limited to 1000 assets per release".
+ASSET_CAP=1000
 
 NOTE="An apk package repository for rollingWRT, an OpenWrt-based x86-64 distribution. Add this release's download URL to a device's apk repositories to install these packages."
 # --prerelease: these tags host the apk feeds, not a user download, so they must never
@@ -18,6 +27,69 @@ gh release view "$TAG" >/dev/null 2>&1 || \
 	gh release create "$TAG" -t "$TITLE" -n "$NOTE" --prerelease >/dev/null 2>&1 || true
 
 err="$(mktemp)"; n=0; ok=0; skip=0
+
+# Package name = filename with the -r<rev>.apk revision and the version segment removed,
+# e.g. kmod-usb-common-6.18.44.769188129-r1.apk -> kmod-usb-common. Trimming from the END
+# is what keeps kmod-8139too and kmod-6lowpan whole; trimming at the first -<digit> would
+# collapse both to "kmod" and make prune treat unrelated packages as one. build.sh hashes
+# the same name to pick a kmod's bucket, so the two rules must stay identical.
+pkgname() { basename "$1" | sed -E 's/-r[0-9]+\.apk$//; s/-[^-]*$//'; }
+
+# PRUNE: delete only SUPERSEDED .apk assets - an older version of a package that this build
+# republishes under a different filename (a kmod's vermagic decimal moved, or a userland -r
+# bumped). A release apk is pruned ONLY when the build contains another apk with the SAME
+# package name. A package the build does not contain AT ALL is KEPT, never deleted: that
+# protects against a build that is missing tracks (e.g. a failed `prev` download on a gated
+# snapshot build) silently wiping the whole feed.
+prune_release() {
+	local keepfiles keepnames pruned a d f attempt
+	# Package names come from $DIR plus PRUNE_SCOPE (the build's other buckets); exact
+	# filenames come from $DIR alone. So an apk that belongs to a sibling release is still
+	# recognised as superseded here, while only this release's own current apks survive.
+	keepfiles="$(mktemp)"; keepnames="$(mktemp)"
+	for f in "$DIR"/*.apk; do [ -f "$f" ] || continue; basename "$f" >> "$keepfiles"; done
+	for d in "$DIR" ${PRUNE_SCOPE:-}; do
+		for f in "$d"/*.apk; do [ -f "$f" ] || continue; pkgname "$f" >> "$keepnames"; done
+	done
+	# A build that produced no apks for this release says nothing about what is stale in it,
+	# and every asset would match a name from PRUNE_SCOPE. Refuse rather than wipe the feed.
+	if [ ! -s "$keepfiles" ]; then
+		echo ">>> prune skipped: $DIR holds no apks" >&2
+		rm -f "$keepfiles" "$keepnames"; return 0
+	fi
+	sort -u "$keepnames" -o "$keepnames"
+	pruned=0
+	while IFS= read -r a; do
+		[ -n "$a" ] || continue
+		grep -qxF "$a" "$keepfiles" && continue                       # exact match: current, keep
+		grep -qxF "$(pkgname "$a")" "$keepnames" || continue          # package absent from the build: KEEP
+		# A kernel bump supersedes every kmod at once, so this deletes ~330 assets back to
+		# back. Back off like the upload loop does, so the secondary rate limit cannot leave
+		# the release half-pruned and still over the cap.
+		for attempt in $(seq 1 20); do
+			gh release delete-asset "$TAG" "$a" -y >"$err" 2>&1 && { pruned=$((pruned+1)); break; }
+			grep -qiE "rate limit|secondary|abuse" "$err" || break
+			echo "  rate-limited deleting $a; wait 60s (attempt $attempt/20)" >&2
+			sleep 60
+		done
+	done < <(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | grep '\.apk$')
+	rm -f "$keepfiles" "$keepnames"
+	echo ">>> pruned $pruned superseded apks from release $TAG"
+}
+
+# Normally we upload first and prune after, so a package's old apk stays downloadable until
+# its replacement is up. That order cannot recover a release that is already at the cap:
+# every upload 422s and the run dies before reaching its prune, leaving the release wedged
+# for good. When what is incoming cannot fit, prune first to make room.
+if [ "${PRUNE:-0}" = 1 ]; then
+	have="$(gh release view "$TAG" --json assets --jq '.assets|length' 2>/dev/null || echo 0)"
+	want="$(ls -1 "$DIR" 2>/dev/null | wc -l)"
+	if [ $((have + want)) -gt "$ASSET_CAP" ]; then
+		echo ">>> $TAG holds $have assets and $want are incoming: pruning before upload to fit under $ASSET_CAP"
+		prune_release
+	fi
+fi
+
 # Existing assets (name + byte size). Skip re-uploading identical ones: the kmods feed
 # is ~1000 files that do not change between same-pin builds, and re-uploading them all
 # every run trips GitHub's secondary rate limit. Same name + same size = same content
@@ -61,29 +133,7 @@ for f in "$DIR"/*; do
 	done
 	sleep 1   # gentle pace so we trip the limit rarely
 done
-rm -f "$err"
 
-# PRUNE: delete only SUPERSEDED .apk assets - an older version of a package that the new
-# feed ($DIR) republishes with a different filename (a kmod's vermagic decimal moved, or a
-# userland -r bumped). A release apk is pruned ONLY when $DIR contains another apk with the
-# SAME package name. A package that $DIR does not contain AT ALL is KEPT, never deleted:
-# that protects against a build that is missing tracks (e.g. a failed `prev` download on a
-# gated snapshot build) silently wiping the whole feed. Package name = filename up to the
-# first '-<digit>' segment.
-pkgname() { basename "$1" | sed -E 's/-[0-9][^/]*$//'; }
-if [ "${PRUNE:-0}" = 1 ]; then
-	keepfiles="$(mktemp)"; keepnames="$(mktemp)"
-	for f in "$DIR"/*.apk; do [ -f "$f" ] || continue; basename "$f" >> "$keepfiles"; pkgname "$f" >> "$keepnames"; done
-	sort -u "$keepnames" -o "$keepnames"
-	pruned=0
-	while IFS= read -r a; do
-		[ -n "$a" ] || continue
-		grep -qxF "$a" "$keepfiles" && continue                       # exact match: current, keep
-		grep -qxF "$(pkgname "$a")" "$keepnames" || continue          # package absent entirely: KEEP (never nuke)
-		gh release delete-asset "$TAG" "$a" -y 2>/dev/null && pruned=$((pruned+1))
-	done < <(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | grep '\.apk$')
-	rm -f "$keepfiles" "$keepnames"
-	echo ">>> pruned $pruned superseded apks from release $TAG"
-fi
+[ "${PRUNE:-0}" = 1 ] && prune_release
 rm -f "$err"
 echo ">>> published $ok new/changed, skipped $skip unchanged (of $n) to release $TAG"

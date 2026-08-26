@@ -289,11 +289,16 @@ if [ "$STAGE" = kernel ]; then
 	ZFS_WITH_CONFIG=kernel make -j"$JOBS" package/feeds/rollingwrt/zfs/compile
 
 	# publish: bucketed kmods (incl. kmod-fs-zfs) + the kernel and rollingwrt-kernel apks
-	# (deterministic bucket per filename hash so a module keeps its release), + the pubkey.
+	# + the pubkey. The bucket is hashed from the PACKAGE NAME, never from the filename: a
+	# kmod's filename carries the kernel vermagic, so a filename hash would move a module to
+	# a different release on every kernel bump and strand its old apk in a release the next
+	# build no longer writes, where gh-publish.sh cannot see it superseded. The name rule
+	# here must stay identical to pkgname() in gh-publish.sh, which prunes by that same key.
 	cp -f "$OWRT/public-key.pem" "$OUT/public-key.pem" 2>/dev/null || true
 	for b in $(seq 1 "$KMOD_BUCKETS"); do mkdir -p "$OUT/kmods-$b"; done
 	while IFS= read -r apk; do
-		b=$(( ( $(printf '%s' "$(basename "$apk")" | cksum | cut -d' ' -f1) % KMOD_BUCKETS ) + 1 ))
+		pkg="$(basename "$apk" | sed -E 's/-r[0-9]+\.apk$//; s/-[^-]*$//')"
+		b=$(( ( $(printf '%s' "$pkg" | cksum | cut -d' ' -f1) % KMOD_BUCKETS ) + 1 ))
 		cp "$apk" "$OUT/kmods-$b/"
 	done < <(find bin/targets bin/packages/x86_64 \( -name 'kmod-*.apk' -o -name 'kernel-*.apk' -o -name 'rollingwrt-kernel-*.apk' \))
 	for b in $(seq 1 "$KMOD_BUCKETS"); do sign_feed "$OWRT" "$OUT/kmods-$b"; done

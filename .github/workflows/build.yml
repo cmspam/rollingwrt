@@ -207,8 +207,13 @@ jobs:
           # filename each time (vermagic decimal), so old apks must be removed or the release
           # grows past GitHub's 1000-asset cap. The snapshot feed does NOT prune (it carries
           # unbuilt tracks over).
+          # PRUNE_SCOPE names every bucket so each release is pruned against the WHOLE build,
+          # not just its own share of it. A kmod whose bucket differs from the one holding its
+          # old apk is then still recognised as superseded, instead of looking like a package
+          # this build never produced (which prune deliberately leaves alone).
           for b in 1 2 3; do
-            PRUNE=1 bash build/gh-publish.sh "snapshot-kmods-$b" "out/kmods-$b" "rollingWRT kernel + kmods $b"
+            PRUNE=1 PRUNE_SCOPE="out/kmods-1 out/kmods-2 out/kmods-3" \
+              bash build/gh-publish.sh "snapshot-kmods-$b" "out/kmods-$b" "rollingWRT kernel + kmods $b"
           done
 
   # NOTE: we do NOT build the LLVM mesa variants (libmesa-amd/intel/llvmpipe). OpenWrt
