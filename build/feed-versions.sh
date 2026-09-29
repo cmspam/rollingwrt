@@ -11,7 +11,7 @@
 #
 # The version is PKG_VERSION-rPKG_RELEASE, so a recipe revision counts as a change.
 # Two packages need more than PKG_VERSION:
-#   incus-ui          PKG_VERSION is only incus's major.minor; the Zabbly .deb build
+#   incus-ui          Zabbly rebuilds the .deb under the same version, so the build
 #                     stamp is what identifies the payload.
 #   rollingwrt-kernel has no PKG_VERSION. It is versioned by the kernel it packages,
 #                     which the resolver gates on separately.

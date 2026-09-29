@@ -43,27 +43,37 @@ bump_github_tarball() { # pkg  owner/repo  tarball-url-template ({v} = version)
 	echo "$pkg $old -> $new"
 }
 
-# --- incus: GitHub release tarball; also drives incus-ui's major.minor ---
+# --- incus: GitHub release tarball. The top directory inside it is not derivable
+#     from the version (7.4.0 unpacks to incus-7.4, 7.5.1 to incus-7.5.1), so
+#     PKG_BUILD_DIR is read from the tarball itself. ---
 bump_incus() {
-	local new old; new="$(gh_latest lxc/incus)"; old="$(cur_ver incus)"
+	local new old tgz top
+	new="$(gh_latest lxc/incus)"; old="$(cur_ver incus)"
 	[ -n "$new" ] && [ "$new" != "$old" ] || return 0
-	set_ver_hash incus "$new" "$(url_sha256 "https://github.com/lxc/incus/releases/download/v$new/incus-$new.tar.gz")"
-	# PKG_BUILD_DIR is pinned to the major.minor (incus-X.Y); keep it in step.
-	sed -i "s#^PKG_BUILD_DIR:=.*#PKG_BUILD_DIR:=\$(BUILD_DIR)/incus-${new%.*}#" "$FEED/incus/Makefile"
+	tgz="$(mktemp)"
+	curl -fsSL -o "$tgz" "https://github.com/lxc/incus/releases/download/v$new/incus-$new.tar.gz"
+	top="$(tar tzf "$tgz" | sed -n '1s#/.*##p')"
+	[ -n "$top" ] || { note "incus: could not read top directory of incus-$new.tar.gz"; rm -f "$tgz"; return 0; }
+	set_ver_hash incus "$new" "$(sha256sum "$tgz" | cut -d' ' -f1)"
+	rm -f "$tgz"
+	sed -i "s#^PKG_BUILD_DIR:=.*#PKG_BUILD_DIR:=\$(BUILD_DIR)/$top#" "$FEED/incus/Makefile"
 	# incus-vm is a metapackage over the same release; it carries incus's version.
 	sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$new/" "$FEED/incus-vm/Makefile"
 	echo "incus $old -> $new"
 }
 
-# --- incus-ui: newest build stamp for the current incus major.minor in the
-#     Zabbly Packages index (architecture-independent .deb) ---
+# --- incus-ui: the newest incus-ui-canonical .deb in the Zabbly Packages index
+#     (highest version, then newest build stamp). Zabbly removes superseded debs
+#     from the pool, so the pin must always follow the index. ---
 bump_incus_ui() {
-	local ver mk pkgs deb new old hash
-	ver="$(cur_ver incus)"; ver="${ver%.*}"          # 7.1.0 -> 7.1
+	local mk pkgs deb ver new old hash
 	mk="$FEED/incus-ui/Makefile"
 	pkgs="$(curl -fsSL https://pkgs.zabbly.com/incus/stable/dists/trixie/main/binary-amd64/Packages)"
-	deb="$(printf '%s' "$pkgs" | sed -n 's#^Filename: .*/\(incus-ui-canonical_'"$ver"'-debian13-[0-9]*_amd64.deb\)#\1#p' | sort | tail -1)"
-	[ -n "$deb" ] || { note "incus-ui: no .deb for incus $ver"; return 0; }
+	deb="$(printf '%s' "$pkgs" | sed -n 's#^Filename: .*/\(incus-ui-canonical_[0-9.]*-debian13-[0-9]*_amd64.deb\)#\1#p' \
+		| sed 's/^incus-ui-canonical_\([0-9.]*\)-debian13-\([0-9]*\)_amd64.deb$/\1 \2 &/' \
+		| sort -k1,1V -k2,2n | tail -1 | cut -d' ' -f3)"
+	[ -n "$deb" ] || { note "incus-ui: no .deb in the Zabbly index"; return 0; }
+	ver="$(printf '%s' "$deb" | sed -n 's/^incus-ui-canonical_\([0-9.]*\)-debian13-.*/\1/p')"
 	new="$(printf '%s' "$deb" | sed -n 's/.*-debian13-\([0-9]*\)_amd64.deb/\1/p')"
 	old="$(sed -n 's/^PKG_DEB_STAMP:=//p' "$mk")"
 	[ "$new" != "$old" ] || return 0

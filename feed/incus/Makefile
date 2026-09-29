@@ -7,7 +7,7 @@ PKG_RELEASE:=1
 PKG_SOURCE:=incus-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/lxc/incus/releases/download/v$(PKG_VERSION)
 PKG_HASH:=a18572cc4e418fe31a38592654b5e17de91deda22c4c1736d5cdac6b366ae4a0
-PKG_BUILD_DIR:=$(BUILD_DIR)/incus-7.5
+PKG_BUILD_DIR:=$(BUILD_DIR)/incus-7.5.1
 
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=Apache-2.0
