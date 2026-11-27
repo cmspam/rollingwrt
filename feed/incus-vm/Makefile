@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=incus-vm
-PKG_VERSION:=7.6.0
+PKG_VERSION:=7.7.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=cmspam

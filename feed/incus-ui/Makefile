@@ -1,15 +1,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=incus-ui
-PKG_VERSION:=7.6
+PKG_VERSION:=7.7
 # Build stamp of the upstream incus-ui-canonical .deb. The update bumper resolves
 # the newest version, stamp and hash from the Zabbly Packages index.
-PKG_DEB_STAMP:=202611072130
+PKG_DEB_STAMP:=202611270611
 PKG_RELEASE:=1
 
 PKG_SOURCE:=incus-ui-canonical_$(PKG_VERSION)-debian13-$(PKG_DEB_STAMP)_amd64.deb
 PKG_SOURCE_URL:=https://pkgs.zabbly.com/incus/stable/pool/main/i/incus
-PKG_HASH:=9b4ba3e561167d26d81a43f9561ade1daf0e24efc3f591224f2863b5d4b16794
+PKG_HASH:=c57836779169810fb1280925e4e4b70007d2be8bfc6742e5bc9fa53434194c86
 
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=AGPL-3.0-only

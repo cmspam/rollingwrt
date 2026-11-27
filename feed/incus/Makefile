@@ -1,13 +1,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=incus
-PKG_VERSION:=7.6.0
+PKG_VERSION:=7.7.0
 PKG_RELEASE:=1
 
 PKG_SOURCE:=incus-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/lxc/incus/releases/download/v$(PKG_VERSION)
-PKG_HASH:=f57dcf2b781f6664b04b264e680d6b05a86303bbee717161110282e2a8891486
-PKG_BUILD_DIR:=$(BUILD_DIR)/incus-7.6
+PKG_HASH:=fbe24ba5894a3c730dc154ef500f3c6dcc4892f8a3017197ef4b9ca6ebbab122
+PKG_BUILD_DIR:=$(BUILD_DIR)/incus-7.7
 
 PKG_MAINTAINER:=cmspam
 PKG_LICENSE:=Apache-2.0
